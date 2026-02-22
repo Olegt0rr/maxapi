@@ -55,7 +55,7 @@ class TestGetHandlerInfo:
         handler = self.make_handler(doc)
         assert get_handler_info(handler) == "Описание с пробелами"
 
-    def test_commands_info_label_at_end_returns_empty_string(self):
+    def test_commands_info_label_at_end_returns_none(self):
         doc = """
         Some text
         commands_info:
