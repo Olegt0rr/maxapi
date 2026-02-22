@@ -1,3 +1,5 @@
+"""Тесты для утилит, связанных с командами бота."""
+
 from maxapi.bot import Bot
 from maxapi.enums.update import UpdateType
 from maxapi.filters.command import Command, CommandsInfo
