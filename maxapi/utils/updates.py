@@ -49,7 +49,7 @@ async def enrich_event(event_object: Any, bot: Bot) -> Any:
 
     if isinstance(event_object, (MessageCreated, MessageEdited)):
         recipient = event_object.message.recipient
-        if recipient.chat_id is not None and not hasattr(event_object, "chat"):
+        if recipient.chat_id is not None and event_object.chat is None:
             event_object.chat = await bot.get_chat_by_id(recipient.chat_id)
 
         event_object.from_user = getattr(event_object.message, "sender", None)
@@ -58,13 +58,13 @@ async def enrich_event(event_object: Any, bot: Bot) -> Any:
         message = event_object.message
         if message is not None and message.recipient.chat_id is not None:
             chat_id = message.recipient.chat_id
-            if not hasattr(event_object, "chat"):
+            if event_object.chat is None:
                 event_object.chat = await bot.get_chat_by_id(chat_id)
 
         event_object.from_user = getattr(event_object.callback, "user", None)
 
     elif isinstance(event_object, MessageRemoved):
-        if not hasattr(event_object, "chat"):
+        if event_object.chat is None:
             event_object.chat = await bot.get_chat_by_id(event_object.chat_id)
 
         if event_object.chat and event_object.chat.type == ChatType.CHAT:
@@ -76,7 +76,7 @@ async def enrich_event(event_object: Any, bot: Bot) -> Any:
             event_object.from_user = event_object.chat
 
     elif isinstance(event_object, UserRemoved):
-        if not hasattr(event_object, "chat"):
+        if event_object.chat is None:
             event_object.chat = await bot.get_chat_by_id(event_object.chat_id)
         if event_object.admin_id:
             event_object.from_user = await bot.get_chat_member(
@@ -97,7 +97,7 @@ async def enrich_event(event_object: Any, bot: Bot) -> Any:
             DialogUnmuted,
         ),
     ):
-        if not hasattr(event_object, "chat"):
+        if event_object.chat is None:
             event_object.chat = await bot.get_chat_by_id(event_object.chat_id)
         event_object.from_user = event_object.user
 
