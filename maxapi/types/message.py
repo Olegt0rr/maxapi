@@ -92,6 +92,235 @@ class MessageBody(BaseModel):
         default_factory=list
     )  # type: ignore
 
+    @property
+    def html_text(self) -> str | None:
+        """
+        Преобразует исходный текст сообщения в HTML строку,
+        основываясь на разметке markup.
+        """
+        if self.text is None:
+            return None
+
+        if not self.markup:
+            return self.text
+
+        char_styles: list[list[tuple[TextStyle, str | None]]] = []
+
+        order = {
+            TextStyle.STRONG: 1,
+            TextStyle.EMPHASIZED: 2,
+            TextStyle.UNDERLINE: 3,
+            TextStyle.STRIKETHROUGH: 4,
+            TextStyle.MONOSPACED: 5,
+            TextStyle.HEADING: 6,
+            TextStyle.LINK: 7,
+            TextStyle.USER_MENTION: 8,
+        }
+
+        for i in range(len(self.text)):
+            active = []
+            for m in self.markup:
+                if m.from_ <= i < m.from_ + m.length:
+                    val = (
+                        getattr(m, "url", None)
+                        if m.type == TextStyle.LINK
+                        else None
+                    )
+                    if m.type == TextStyle.USER_MENTION:
+                        val = self.text[m.from_ : m.from_ + m.length]
+                    active.append((m.type, val))
+
+            active.sort(key=lambda x: order.get(x[0], 99))
+
+            unique_active = []
+            for a in active:
+                if a not in unique_active:
+                    unique_active.append(a)
+            char_styles.append(unique_active)
+
+        result: list[str] = []
+        current_tags: list[tuple[TextStyle, str | None]] = []
+
+        def get_open_tag(t: TextStyle, val: str | None) -> str:
+            if t == TextStyle.STRONG:
+                return "<b>"
+            if t == TextStyle.EMPHASIZED:
+                return "<i>"
+            if t == TextStyle.UNDERLINE:
+                return "<ins>"
+            if t == TextStyle.STRIKETHROUGH:
+                return "<s>"
+            if t == TextStyle.MONOSPACED:
+                return "<code>"
+            if t == TextStyle.HEADING:
+                return "<b>"
+            if t == TextStyle.LINK and val:
+                return f'<a href="{val}">'
+            if t == TextStyle.USER_MENTION and val:
+                return f'<a href="max://user/{val}">'
+            return ""
+
+        def get_close_tag(t: TextStyle) -> str:
+            if t == TextStyle.STRONG:
+                return "</b>"
+            if t == TextStyle.EMPHASIZED:
+                return "</i>"
+            if t == TextStyle.UNDERLINE:
+                return "</ins>"
+            if t == TextStyle.STRIKETHROUGH:
+                return "</s>"
+            if t == TextStyle.MONOSPACED:
+                return "</code>"
+            if t == TextStyle.HEADING:
+                return "</b>"
+            if t in (TextStyle.LINK, TextStyle.USER_MENTION):
+                return "</a>"
+            return ""
+
+        for i in range(len(self.text)):
+            target_tags = char_styles[i]
+
+            common_len = 0
+            for curr, tgt in zip(current_tags, target_tags, strict=False):
+                if curr == tgt:
+                    common_len += 1
+                else:
+                    break
+
+            result.extend(
+                get_close_tag(curr[0])
+                for curr in reversed(current_tags[common_len:])
+            )
+            result.extend(
+                get_open_tag(tgt[0], tgt[1])
+                for tgt in target_tags[common_len:]
+            )
+
+            current_tags = target_tags
+            result.append(self.text[i])
+
+        result.extend(
+            get_close_tag(curr[0]) for curr in reversed(current_tags)
+        )
+
+        return "".join(result)
+
+    @property
+    def md_text(self) -> str | None:
+        """
+        Преобразует исходный текст сообщения в Markdown строку,
+        основываясь на разметке markup.
+        """
+        if self.text is None:
+            return None
+
+        if not self.markup:
+            return self.text
+
+        char_styles: list[list[tuple[TextStyle, str | None]]] = []
+
+        order = {
+            TextStyle.STRONG: 1,
+            TextStyle.EMPHASIZED: 2,
+            TextStyle.UNDERLINE: 3,
+            TextStyle.STRIKETHROUGH: 4,
+            TextStyle.MONOSPACED: 5,
+            TextStyle.HEADING: 6,
+            TextStyle.LINK: 7,
+            TextStyle.USER_MENTION: 8,
+        }
+
+        for i in range(len(self.text)):
+            active = []
+            for m in self.markup:
+                if m.from_ <= i < m.from_ + m.length:
+                    val = (
+                        getattr(m, "url", None)
+                        if m.type == TextStyle.LINK
+                        else None
+                    )
+                    if m.type == TextStyle.USER_MENTION:
+                        val = self.text[m.from_ : m.from_ + m.length]
+                    active.append((m.type, val))
+
+            active.sort(key=lambda x: order.get(x[0], 99))
+
+            unique_active = []
+            for a in active:
+                if a not in unique_active:
+                    unique_active.append(a)
+            char_styles.append(unique_active)
+
+        result: list[str] = []
+        current_tags: list[tuple[TextStyle, str | None]] = []
+
+        def get_open_tag(t: TextStyle, val: str | None) -> str:
+            if t == TextStyle.STRONG:
+                return "**"
+            if t == TextStyle.EMPHASIZED:
+                return "*"
+            if t == TextStyle.UNDERLINE:
+                return "++"
+            if t == TextStyle.STRIKETHROUGH:
+                return "~~"
+            if t == TextStyle.MONOSPACED:
+                return "`"
+            if t == TextStyle.HEADING:
+                return "### "
+            if t == TextStyle.LINK and val:
+                return "["
+            if t == TextStyle.USER_MENTION and val:
+                return "["
+            return ""
+
+        def get_close_tag(t: TextStyle, val: str | None) -> str:
+            if t == TextStyle.STRONG:
+                return "**"
+            if t == TextStyle.EMPHASIZED:
+                return "*"
+            if t == TextStyle.UNDERLINE:
+                return "++"
+            if t == TextStyle.STRIKETHROUGH:
+                return "~~"
+            if t == TextStyle.MONOSPACED:
+                return "`"
+            if t == TextStyle.HEADING:
+                return ""
+            if t == TextStyle.LINK and val:
+                return f"]({val})"
+            if t == TextStyle.USER_MENTION and val:
+                return f"](max://user/{val})"
+            return ""
+
+        for i in range(len(self.text)):
+            target_tags = char_styles[i]
+
+            common_len = 0
+            for curr, tgt in zip(current_tags, target_tags, strict=False):
+                if curr == tgt:
+                    common_len += 1
+                else:
+                    break
+
+            result.extend(
+                get_close_tag(curr[0], curr[1])
+                for curr in reversed(current_tags[common_len:])
+            )
+            result.extend(
+                get_open_tag(tgt[0], tgt[1])
+                for tgt in target_tags[common_len:]
+            )
+
+            current_tags = target_tags
+
+            result.append(self.text[i])
+
+        result.extend(
+            get_close_tag(curr[0], curr[1]) for curr in reversed(current_tags)
+        )
+
+        return "".join(result)
+
 
 class MessageStat(BaseModel):
     """
