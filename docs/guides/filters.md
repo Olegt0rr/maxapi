@@ -15,7 +15,7 @@ async def text_handler(event: MessageCreated):
     ...
 
 # Сообщения с вложениями
-@dp.message_created(F.message.attachments)
+@dp.message_created(F.message.body.attachments)
 async def attachment_handler(event: MessageCreated):
     ...
 
