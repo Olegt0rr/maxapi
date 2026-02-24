@@ -5,7 +5,6 @@ import functools
 import warnings
 from asyncio.exceptions import TimeoutError as AsyncioTimeoutError
 from datetime import datetime
-from re import DOTALL, search
 from typing import TYPE_CHECKING, Any, Literal
 
 from aiohttp import ClientConnectorError
@@ -15,7 +14,6 @@ from .enums.update import UpdateType
 from .exceptions.dispatcher import HandlerException, MiddlewareException
 from .exceptions.max import InvalidToken, MaxApiError, MaxConnection
 from .filters import filter_attrs
-from .filters.command import CommandsInfo
 from .filters.handler import Handler
 from .loggers import logger_dp
 from .methods.types.getted_updates import (
@@ -24,6 +22,7 @@ from .methods.types.getted_updates import (
 )
 from .types.bot_mixin import BotMixin
 from .types.updates import UNKNOWN_UPDATE_DISCLAIMER, UpdateUnion
+from .utils.commands import extract_commands
 from .utils.time import from_ms, to_ms
 
 try:
@@ -53,7 +52,6 @@ if TYPE_CHECKING:
 
 CONNECTION_RETRY_DELAY = 30
 GET_UPDATES_RETRY_DELAY = 5
-COMMANDS_INFO_PATTERN = r"commands_info:\s*(.*?)(?=\n|$)"
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 8080
 
@@ -249,7 +247,7 @@ class Dispatcher(BotMixin):
 
     async def __ready(self, bot: Bot) -> None:
         """
-        Подготавливает диспетчер: сохраняет бота, регистрирует
+        Подготавливает диспетчер: сохраняет бота, подготавливает
         обработчики, вызывает on_started.
 
         Args:
@@ -259,58 +257,47 @@ class Dispatcher(BotMixin):
         self.bot = bot
         self.bot.dispatcher = self
 
-        if self.polling and self.bot.auto_check_subscriptions:
-            response = await self.bot.get_subscriptions()
-
-            if response.subscriptions:
-                logger_subscriptions_text = ", ".join(
-                    [s.url for s in response.subscriptions]
-                )
-                logger_dp.warning(
-                    "БОТ ИГНОРИРУЕТ POLLING! "
-                    "Обнаружены установленные подписки: %s",
-                    logger_subscriptions_text,
-                )
+        if self.polling and bot.auto_check_subscriptions:
+            await self._check_subscriptions(bot)
 
         await self.check_me()
 
         self.routers += [self]
+        self._prepare_handlers(bot)
+
+        if self.on_started_func:
+            await self.on_started_func()
+
+    def _prepare_handlers(self, bot: Bot) -> None:
+        """Подготовить обработчики событий."""
+
+        handlers_count = 0
 
         for router in self.routers:
             router.bot = bot
 
             for handler in router.event_handlers:
-                if handler.base_filters is None:
-                    continue
-
-                for base_filter in handler.base_filters:
-                    commands = getattr(base_filter, "commands", None)
-
-                    if commands and type(commands) is list:
-                        handler_doc = handler.func_event.__doc__
-                        extracted_info = None
-
-                        if handler_doc:
-                            from_pattern = search(
-                                COMMANDS_INFO_PATTERN, handler_doc, DOTALL
-                            )
-                            if from_pattern:
-                                extracted_info = from_pattern.group(1).strip()
-
-                        self.bot.commands.append(
-                            CommandsInfo(commands, extracted_info)
-                        )
-
-        handlers_count = sum(
-            len(router.event_handlers) for router in self.routers
-        )
+                handlers_count += 1
+                extract_commands(handler, bot)
 
         logger_dp.info(
             f"Зарегистрировано {handlers_count} обработчиков событий"
         )
 
-        if self.on_started_func:
-            await self.on_started_func()
+    @staticmethod
+    async def _check_subscriptions(bot: Bot) -> None:
+        """Проверить наличие подписок при запуске polling."""
+        response = await bot.get_subscriptions()
+
+        if subscriptions := response.subscriptions:
+            logger_subscriptions_text = ", ".join(
+                [s.url for s in subscriptions]
+            )
+            logger_dp.warning(
+                "БОТ ИГНОРИРУЕТ POLLING! "
+                "Обнаружены установленные подписки: %s",
+                logger_subscriptions_text,
+            )
 
     def __get_context(
         self, chat_id: int | None, user_id: int | None

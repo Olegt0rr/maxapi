@@ -107,11 +107,10 @@ target-version = "py310"
 
 
 [tool.ruff.lint]
-# TODO: добавить BLE C90 N PGH PLR TRY
+# TODO: добавить BLE N PGH PLR TRY
 select = ["ALL"]
 ignore = [
     "BLE", # TODO: требует рефакторинга
-    "C90", # TODO: требует рефакторинга
     "G004", # TODO: требует рефакторинга
     "ERA", # TODO: требует рефакторинга
     "N", # TODO: требует рефакторинга
@@ -153,6 +152,19 @@ flake8-type-checking.runtime-evaluated-base-classes = [
 ]
 "dispatcher.py" = [
     "B023", # TODO: требует рефакторинга dispatcher
+    "C90", # TODO: требует рефакторинга dispatcher
+]
+"maxapi/utils/updates.py" = [
+    "C90", # TODO: требует рефакторинга
+]
+"maxapi/methods/send_message.py" = [
+    "C90", # TODO: требует рефакторинга
+]
+"maxapi/methods/edit_message.py" = [
+    "C90", # TODO: требует рефакторинга
+]
+"maxapi/connection/base.py" = [
+    "C90", # TODO: требует рефакторинга
 ]
 
 [tool.ruff.format]

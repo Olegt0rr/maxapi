@@ -3,12 +3,13 @@
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
-
-# Core Stuff
-from maxapi import Dispatcher, F
+from maxapi.bot import Bot
 from maxapi.context import MemoryContext
-from maxapi.dispatcher import Event, Router
+from maxapi.dispatcher import Dispatcher, Event, Router
 from maxapi.enums.update import UpdateType
+from maxapi.filters import F
+from maxapi.filters.command import Command, CommandsInfo
+from maxapi.filters.handler import Handler
 from maxapi.types.updates.bot_started import BotStarted
 from maxapi.types.updates.message_created import MessageCreated
 
@@ -110,6 +111,83 @@ class TestDispatcherHandlers:
             pass
 
         assert dispatcher.on_started_func is not None
+
+
+class TestPrepareHandlers:
+    @staticmethod
+    def make_handler_with_doc(commands, info):
+        def func(): ...
+
+        func.__doc__ = f"""
+        commands_info: {info}
+        """
+        return Handler(
+            Command(commands),
+            func_event=func,
+            update_type=UpdateType.ON_STARTED,
+        )
+
+    def test_prepare_handlers_assigns_bot_and_extracts_commands(self):
+        bot = Bot(token="test")
+        dp = Dispatcher()
+        router = Router("r1")
+
+        handler = self.make_handler_with_doc("start", "Запустить бота")
+        router.event_handlers.append(handler)
+
+        dp.routers.append(router)
+
+        # до подготовки bot ещё не присвоен
+        assert router.bot is None
+        assert bot.commands == []
+
+        dp._prepare_handlers(bot)
+
+        # после подготовки router должен иметь ссылку на bot
+        assert router.bot is bot
+
+        # команды из handler должны быть добавлены в bot.commands
+        assert bot.commands == [
+            CommandsInfo(commands=["start"], info="Запустить бота")
+        ]
+
+    def test_prepare_handlers_multiple_routers_and_handlers(self):
+        bot = Bot(token="test")
+        dp = Dispatcher()
+
+        r1 = Router("r1")
+        r2 = Router("r2")
+
+        h1 = self.make_handler_with_doc("a", "info1")
+        h2 = self.make_handler_with_doc(["b", "c"], "info2")
+
+        r1.event_handlers.append(h1)
+        r2.event_handlers.append(h2)
+
+        dp.routers.extend([r1, r2])
+
+        dp._prepare_handlers(bot)
+
+        assert r1.bot is bot
+        assert r2.bot is bot
+
+        # порядок добавления соответствует обходу роутеров и обработчиков
+        assert bot.commands == [
+            CommandsInfo(commands=["a"], info="info1"),
+            CommandsInfo(commands=["b", "c"], info="info2"),
+        ]
+
+    def test_prepare_handlers_with_no_event_handlers_does_nothing(self):
+        bot = Bot(token="test")
+        dp = Dispatcher()
+        router = Router("r1")
+
+        dp.routers.append(router)
+
+        dp._prepare_handlers(bot)
+
+        assert router.bot is bot
+        assert bot.commands == []
 
 
 class TestDispatcherRouters:
@@ -321,3 +399,100 @@ class TestDispatcherAsync:
         )
 
         assert result is False
+
+
+class TestDispatcherSubscriptions:
+    async def test_check_subscriptions_no_subscriptions(
+        self, dispatcher, bot, caplog
+    ):
+        """Если подписок нет, предупреждение не логируется."""
+        dispatcher.bot = bot
+        bot.get_subscriptions = AsyncMock(return_value=Mock(subscriptions=[]))
+
+        caplog.set_level("WARNING")
+        await dispatcher._check_subscriptions(bot)
+
+        # Проверяем, что предупреждение с ключевой фразой не встречается
+        assert not any(
+            (
+                record.levelname == "WARNING"
+                and "БОТ ИГНОРИРУЕТ POLLING!" in record.getMessage()
+            )
+            for record in caplog.records
+        )
+
+    async def test_check_subscriptions_warns_when_subscriptions(
+        self, dispatcher, bot, caplog
+    ):
+        """Если подписки есть, логируется предупреждение с URL'ами."""
+        dispatcher.bot = bot
+        subs = [Mock(url="https://a"), Mock(url="https://b")]
+        bot.get_subscriptions = AsyncMock(
+            return_value=Mock(subscriptions=subs)
+        )
+
+        caplog.set_level("WARNING")
+        await dispatcher._check_subscriptions(bot)
+
+        warns = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert warns, "Ожидалось предупреждение при найденных подписках"
+
+        # Проверяем текст предупреждения и наличие URL'ов
+        assert any("БОТ ИГНОРИРУЕТ POLLING!" in r.getMessage() for r in warns)
+        joined = ", ".join([s.url for s in subs])
+        assert any(joined in r.getMessage() for r in warns)
+
+
+class TestDispatcherReady:
+    async def test_ready_triggers_subscriptions_and_prepare_and_on_started(
+        self, dispatcher, bot
+    ):
+        """Если включён polling и auto_check_subscriptions,
+        вызываются проверки подписок, check_me, prepare и on_started.
+        """
+        dispatcher.polling = True
+        bot.auto_check_subscriptions = True
+
+        # Подменяем методы, чтобы отследить вызовы
+        dispatcher._check_subscriptions = AsyncMock()
+        dispatcher.check_me = AsyncMock()
+        dispatcher._prepare_handlers = Mock()
+        dispatcher.on_started_func = AsyncMock()
+
+        # Вызов приватного метода __ready
+        await dispatcher._Dispatcher__ready(bot)
+
+        # Убедимся, что бот присвоен и бот знает диспетчера
+        assert dispatcher.bot is bot
+        assert bot.dispatcher is dispatcher
+
+        # Проверяем, что были вызваны ожидаемые методы
+        dispatcher._check_subscriptions.assert_called()
+        dispatcher.check_me.assert_called()
+        dispatcher._prepare_handlers.assert_called_once_with(bot)
+        dispatcher.on_started_func.assert_called()
+
+        # Dispatcher должен добавить себя в список роутеров
+        assert dispatcher in dispatcher.routers
+
+    async def test_ready_skips_subscriptions_when_polling_disabled(
+        self, dispatcher, bot
+    ):
+        """Если polling отключён, проверка подписок не выполняется."""
+        dispatcher.polling = False
+        bot.auto_check_subscriptions = True
+
+        dispatcher._check_subscriptions = AsyncMock()
+        dispatcher.check_me = AsyncMock()
+        dispatcher._prepare_handlers = Mock()
+        dispatcher.on_started_func = None
+
+        await dispatcher._Dispatcher__ready(bot)
+
+        # _check_subscriptions не должен вызываться
+        dispatcher._check_subscriptions.assert_not_called()
+
+        # Остальные шаги должны выполниться
+        dispatcher.check_me.assert_called()
+        dispatcher._prepare_handlers.assert_called_once_with(bot)
+        assert dispatcher in dispatcher.routers
