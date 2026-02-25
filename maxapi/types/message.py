@@ -94,8 +94,8 @@ class MessageBody(BaseModel):
 
     def _get_char_styles(self) -> list[list[tuple[TextStyle, str | None]]]:
         """Возвращает список применённых стилей для каждого символа."""
-        if self.text is None or not self.markup:
-            return []
+        text = self.text or ""
+        markup = self.markup or []
 
         char_styles: list[list[tuple[TextStyle, str | None]]] = []
 
@@ -110,9 +110,9 @@ class MessageBody(BaseModel):
             TextStyle.USER_MENTION: 8,
         }
 
-        for i in range(len(self.text)):
+        for i in range(len(text)):
             active = []
-            for m in self.markup:
+            for m in markup:
                 if m.from_ <= i < m.from_ + m.length:
                     val = (
                         getattr(m, "url", None)
@@ -120,7 +120,7 @@ class MessageBody(BaseModel):
                         else None
                     )
                     if m.type == TextStyle.USER_MENTION:
-                        val = self.text[m.from_ : m.from_ + m.length]
+                        val = text[m.from_ : m.from_ + m.length]
                     active.append((m.type, val))
 
             active.sort(key=lambda x: order.get(x[0], 99))
