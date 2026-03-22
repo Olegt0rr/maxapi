@@ -218,3 +218,151 @@ async def test_handle_webhook_custom_path_serves_at_that_path(monkeypatch):
 
     resp_root = client.post("/", json=payload)
     assert resp_root.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Тесты проверки X-Max-Bot-Api-Secret
+# ---------------------------------------------------------------------------
+
+
+def _make_dp_with_secret(monkeypatch, secret: str):
+    """Вспомогательная функция: создаёт Dispatcher с webhook_secret."""
+    dp = Dispatcher()
+
+    async def fake_init_serve(*args, **kwargs):
+        return None
+
+    dp.init_serve = fake_init_serve
+    monkeypatch.setattr(dispatcher_module, "UVICORN_INSTALLED", True)
+    monkeypatch.setattr(dispatcher_module, "Request", Request, raising=False)
+
+    event = DummyEvent(update_type="MESSAGE_CREATED")
+
+    async def fake_process_update_webhook(event_json, bot):
+        return event
+
+    monkeypatch.setattr(
+        dispatcher_module,
+        "process_update_webhook",
+        fake_process_update_webhook,
+    )
+
+    handled = {}
+
+    async def fake_handle(event_object):
+        handled["obj"] = event_object
+
+    dp.handle = fake_handle
+
+    return dp, handled, event
+
+
+async def test_handle_webhook_secret_valid_header_passes(monkeypatch):
+    """Запрос с верным заголовком X-Max-Bot-Api-Secret должен проходить."""
+    secret = "my-secret-123"
+    dp, handled, event = _make_dp_with_secret(monkeypatch, secret)
+
+    class DummyBot:
+        pass
+
+    await dp.handle_webhook(bot=DummyBot(), webhook_secret=secret)
+
+    client = TestClient(dp.webhook_app)
+    payload = {"update_type": "MESSAGE_CREATED", "payload": {}}
+    resp = client.post(
+        "/",
+        json=payload,
+        headers={"X-Max-Bot-Api-Secret": secret},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+    assert handled.get("obj") is event
+
+
+async def test_handle_webhook_secret_wrong_header_returns_401(monkeypatch):
+    """Запрос с неверным заголовком X-Max-Bot-Api-Secret должен вернуть 401."""
+    secret = "my-secret-123"
+    dp, handled, _ = _make_dp_with_secret(monkeypatch, secret)
+
+    class DummyBot:
+        pass
+
+    await dp.handle_webhook(bot=DummyBot(), webhook_secret=secret)
+
+    client = TestClient(dp.webhook_app, raise_server_exceptions=False)
+    payload = {"update_type": "MESSAGE_CREATED", "payload": {}}
+    resp = client.post(
+        "/",
+        json=payload,
+        headers={"X-Max-Bot-Api-Secret": "wrong-secret"},
+    )
+
+    assert resp.status_code == 401
+    assert resp.json() == {"ok": False, "error": "Unauthorized"}
+    assert handled.get("obj") is None
+
+
+async def test_handle_webhook_secret_missing_header_returns_401(monkeypatch):
+    """Запрос без заголовка X-Max-Bot-Api-Secret должен вернуть 401."""
+    secret = "my-secret-123"
+    dp, handled, _ = _make_dp_with_secret(monkeypatch, secret)
+
+    class DummyBot:
+        pass
+
+    await dp.handle_webhook(bot=DummyBot(), webhook_secret=secret)
+
+    client = TestClient(dp.webhook_app, raise_server_exceptions=False)
+    payload = {"update_type": "MESSAGE_CREATED", "payload": {}}
+    resp = client.post("/", json=payload)
+
+    assert resp.status_code == 401
+    assert resp.json() == {"ok": False, "error": "Unauthorized"}
+    assert handled.get("obj") is None
+
+
+async def test_handle_webhook_no_secret_ignores_header(monkeypatch):
+    """Если webhook_secret не задан, любой запрос должен проходить."""
+    dp = Dispatcher()
+
+    async def fake_init_serve(*args, **kwargs):
+        return None
+
+    dp.init_serve = fake_init_serve
+    monkeypatch.setattr(dispatcher_module, "UVICORN_INSTALLED", True)
+    monkeypatch.setattr(dispatcher_module, "Request", Request, raising=False)
+
+    async def fake_process_update_webhook(event_json, bot):
+        return None
+
+    monkeypatch.setattr(
+        dispatcher_module,
+        "process_update_webhook",
+        fake_process_update_webhook,
+    )
+
+    async def fake_handle(event_object):
+        pass
+
+    dp.handle = fake_handle
+
+    class DummyBot:
+        pass
+
+    await dp.handle_webhook(bot=DummyBot())
+
+    client = TestClient(dp.webhook_app)
+    payload = {"update_type": "UNKNOWN"}
+
+    # Без заголовка
+    resp1 = client.post("/", json=payload)
+    assert resp1.status_code == 200
+
+    # С произвольным заголовком
+    resp2 = client.post(
+        "/",
+        json=payload,
+        headers={"X-Max-Bot-Api-Secret": "any-value"},
+    )
+    assert resp2.status_code == 200

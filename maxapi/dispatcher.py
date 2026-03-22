@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import hmac
 import warnings
 from asyncio.exceptions import TimeoutError as AsyncioTimeoutError
 from datetime import datetime
@@ -55,6 +56,7 @@ GET_UPDATES_RETRY_DELAY = 5
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 8080
 DEFAULT_PATH = "/"
+WEBHOOK_SECRET_HEADER = "X-Max-Bot-Api-Secret"  # noqa: S105
 
 
 class Dispatcher(BotMixin):
@@ -766,6 +768,7 @@ class Dispatcher(BotMixin):
         host: str = DEFAULT_HOST,
         port: int = DEFAULT_PORT,
         path: str = DEFAULT_PATH,
+        webhook_secret: str | None = None,
         **kwargs: Any,
     ) -> None:
         """
@@ -776,6 +779,11 @@ class Dispatcher(BotMixin):
             host (str): Хост сервера.
             port (int): Порт сервера.
             path (str): Путь для вебхука.
+            webhook_secret (Optional[str]): Секрет, заданный при вызове
+                bot.subscribe_webhook(secret=...). Если указан, каждый
+                входящий запрос должен содержать заголовок
+                ``X-Max-Bot-Api-Secret`` с этим значением; при несовпадении
+                возвращается ответ 401 Unauthorized.
         """
 
         if not FASTAPI_INSTALLED:
@@ -798,6 +806,21 @@ class Dispatcher(BotMixin):
 
         @self.webhook_post(path)
         async def _(request: Request) -> JSONResponse:
+            if webhook_secret is not None:
+                incoming_secret = request.headers.get(WEBHOOK_SECRET_HEADER)
+                if incoming_secret is None or not hmac.compare_digest(
+                    incoming_secret, webhook_secret
+                ):
+                    logger_dp.warning(
+                        "Отклонён запрос вебхука: неверный или "
+                        "отсутствующий заголовок %s",
+                        WEBHOOK_SECRET_HEADER,
+                    )
+                    return JSONResponse(
+                        content={"ok": False, "error": "Unauthorized"},
+                        status_code=401,
+                    )
+
             event_json = await request.json()
             event_object = await process_update_webhook(
                 event_json=event_json, bot=bot
