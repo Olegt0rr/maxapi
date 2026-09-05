@@ -110,6 +110,10 @@ filterwarnings = [
 ]
 
 
+[tool.coverage.report]
+# Порог покрытия unit-тестами; сейчас ~93%.
+fail_under = 90
+
 [tool.ruff]
 src = ["maxapi", "tests"]
 exclude = ["core/yandex/cloud", "core/google"]

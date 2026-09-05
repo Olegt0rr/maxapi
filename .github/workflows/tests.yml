@@ -16,9 +16,23 @@ on:
 permissions:
   contents: read
 
+# Отменяем только устаревшие прогоны PR; на push и при вызове из
+# publish.yml группа по SHA, чтобы релизные прогоны не вставали в
+# очередь друг за другом и не отменяли друг друга.
+# Инфикс `-tests-` обязателен: при вызове через `uses:` из
+# publish.yml `github.workflow` резолвится в имя ВЫЗЫВАЮЩЕГО workflow,
+# и без инфикса все четыре гейта попали бы в одну группу и встали бы
+# в очередь друг за другом.
+concurrency:
+  group: >-
+    ${{ github.workflow }}-tests-${{ github.event_name == 'pull_request'
+    && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
@@ -27,6 +41,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4
@@ -39,8 +55,18 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies with ${{ matrix.dependency-resolution }} resolution
+        env:
+          RESOLUTION: ${{ matrix.dependency-resolution }}
         run: |
-          uv sync --all-groups --resolution ${{ matrix.dependency-resolution }}
+          # uv.lock зафиксирован в режиме `highest`: там --locked ловит
+          # его рассинхрон с pyproject.toml, а резолюция не запускается
+          # вовсе, поэтому --resolution не нужен. Для `lowest-direct`
+          # резолюция считается заново, lock-файл к ней неприменим.
+          if [ "$RESOLUTION" = "highest" ]; then
+            uv sync --all-groups --locked
+          else
+            uv sync --all-groups --resolution "$RESOLUTION"
+          fi
 
       - name: Run unit tests
         run: |

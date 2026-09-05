@@ -11,13 +11,29 @@ on:
 permissions:
   contents: read
 
+# Отменяем только устаревшие прогоны PR; на push и при вызове из
+# publish.yml группа по SHA, чтобы релизные прогоны не вставали в
+# очередь друг за другом и не отменяли друг друга.
+# Инфикс `-lint-` обязателен: при вызове через `uses:` из
+# publish.yml `github.workflow` резолвится в имя ВЫЗЫВАЮЩЕГО workflow,
+# и без инфикса все четыре гейта попали бы в одну группу и встали бы
+# в очередь друг за другом.
+concurrency:
+  group: >-
+    ${{ github.workflow }}-lint-${{ github.event_name == 'pull_request'
+    && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   ruff:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4
@@ -31,7 +47,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          uv sync --all-groups
+          uv sync --all-groups --locked
 
       - name: Run ruff check
         run: |
@@ -40,3 +56,9 @@ jobs:
       - name: Run ruff format check
         run: |
           uv run ruff format . --check
+
+      # Проверяет сами workflow: синтаксис, контексты выражений и
+      # shellcheck по блокам `run`.
+      - name: Lint GitHub workflows
+        run: |
+          uvx --from actionlint-py actionlint -color
