@@ -3,8 +3,8 @@ rules:
   unpinned-uses:
     config:
       policies:
-        # Достаточно тега или SHA; плавающие ветки (@master, @release/v1)
-        # запрещены. Переход на hash-pin — отдельным решением.
+        # Достаточно тега или SHA; ссылки на ветки запрещены.
+        # Переход на hash-pin — отдельным решением.
         "*": ref-pin
   artipacked:
     ignore:
