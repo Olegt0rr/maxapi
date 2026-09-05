@@ -3,6 +3,7 @@ name = "maxapi"
 version = "1.2.2"
 description = "Библиотека для разработки чат-ботов с помощью API мессенджера MAX"
 readme = "README.md"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [{ name = "Denis", email = "bestloveapples@gmail.com" }]
 keywords = ["max", "api", "bot"]
@@ -25,21 +26,15 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/love-apples/maxapi"
 
-[tool.setuptools]
-license-files = []
-
-[tool.setuptools.package-data]
-maxapi = ["py.typed", "client/russiantrustedca.pem"]
-
 [build-system]
-requires = [
-    "setuptools>=82.0.0",
-    "wheel>=0.46.3",
-]
-build-backend = "setuptools.build_meta"
+requires = ["uv_build>=0.12.0,<0.13.0"]
+build-backend = "uv_build"
 
-[tool.setuptools.packages.find]
-include = ["maxapi*"]
+[tool.uv.build-backend]
+# Flat layout: пакет maxapi/ лежит в корне, а не в src/.
+module-root = ""
+# В wheel уходит только maxapi/; в sdist дополнительно тесты и примеры.
+source-include = ["tests/**", "examples/**"]
 
 [project.optional-dependencies]
 fastapi = [
