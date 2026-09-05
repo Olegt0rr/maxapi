@@ -6,6 +6,15 @@ on:
   pull_request:
     branches: [main, develop]
   workflow_dispatch:
+  workflow_call:
+    secrets:
+      MAX_BOT_TOKEN:
+        required: false
+      TEST_CHAT_ID:
+        required: false
+
+permissions:
+  contents: read
 
 jobs:
   test:

@@ -7,12 +7,22 @@ on:
       - 'pyproject.toml'
   workflow_dispatch:
 
+# Дефолт для check-version и вызываемых гейтов; job `publish` ниже
+# переопределяет его своим блоком permissions.
+# Вызываемые workflow не могут запросить больше прав, чем задано тут.
+permissions:
+  contents: read
+
 jobs:
   check-version:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
       changed: ${{ steps.changed.outputs.changed }}
+      should_release: >-
+        ${{ github.ref == 'refs/heads/main'
+        && (steps.changed.outputs.changed == 'true'
+        || github.event_name == 'workflow_dispatch') }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -57,9 +67,34 @@ jobs:
             echo "Version not changed: $CURRENT_VERSION"
           fi
 
-  publish:
+  # Гейты вызываются отсюда, а не отдельными workflow: проверки идут на
+  # публикуемом SHA и в одной цепочке `needs` с publish. Дефолтная
+  # семантика `needs` (без `always()`) не даст publish стартовать, если
+  # любой гейт упал или был пропущен. Единое условие `should_release`
+  # не гоняет матрицу тестов на push в main без смены версии и разрешает
+  # ручной запуск только с main (иначе publish с любой ветки).
+  lint:
     needs: check-version
-    if: needs.check-version.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+    if: needs.check-version.outputs.should_release == 'true'
+    uses: ./.github/workflows/lint.yml
+
+  mypy:
+    needs: check-version
+    if: needs.check-version.outputs.should_release == 'true'
+    uses: ./.github/workflows/mypy.yml
+
+  # Секреты — явно, не `secrets: inherit`: только то, что нужно тестам.
+  tests:
+    needs: check-version
+    if: needs.check-version.outputs.should_release == 'true'
+    uses: ./.github/workflows/tests.yml
+    secrets:
+      MAX_BOT_TOKEN: ${{ secrets.MAX_BOT_TOKEN }}
+      TEST_CHAT_ID: ${{ secrets.TEST_CHAT_ID }}
+
+  publish:
+    needs: [check-version, lint, mypy, tests]
+    if: needs.check-version.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write  # Для создания GitHub Release
@@ -94,8 +129,10 @@ jobs:
           print-hash: true
 
       - name: Create and push git tag
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
         run: |
-          TAG="v${{ needs.check-version.outputs.version }}"
+          TAG="v$VERSION"
 
           if git ls-remote --tags origin "refs/tags/$TAG" | grep -q "refs/tags/$TAG$"; then
             echo "Tag $TAG already exists on origin, skipping tag creation and push."
