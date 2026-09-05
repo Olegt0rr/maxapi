@@ -372,6 +372,45 @@ class TestLateMiddlewareAndFilters:
             for record in caplog.records
         )
 
+    async def test_on_started_registered_during_preparation_is_called(
+        self, dispatcher, bot, caplog
+    ):
+        """Регистрация из-под долгого check_me не считается поздней.
+
+        Окно подготовки ДО фазы on_started (проверка подписок,
+        ``check_me``) поздним не является: ``on_started_func``
+        читается позже, колбэк будет вызван в этом же запуске —
+        предупреждать не о чем.
+        """
+        calls: list[str] = []
+        in_check_me = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _slow_check_me():
+            in_check_me.set()
+            await release.wait()
+
+        dispatcher.check_me = _slow_check_me
+
+        with caplog.at_level("WARNING", logger="dispatcher"):
+            startup = asyncio.create_task(dispatcher.startup(bot))
+            await asyncio.wait_for(in_check_me.wait(), 1)
+
+            @dispatcher.on_started()
+            async def _on_started():
+                calls.append("вызван")
+
+            release.set()
+            await asyncio.wait_for(startup, 1)
+
+        assert calls == ["вызван"]
+        assert dispatcher._ready is True
+        assert not [
+            record
+            for record in caplog.records
+            if "он не будет вызван" in record.getMessage()
+        ]
+
     async def test_late_command_handler_extracts_commands(
         self, dispatcher, bot
     ):
@@ -526,39 +565,60 @@ class TestInvalidation:
     async def test_invalidation_reaches_all_parents(
         self, dispatcher, bot, fixture_message_created
     ):
-        """Роутер в нескольких родителях инвалидирует оба дерева."""
+        """Роутер под двумя родителями инвалидирует корень по обоим путям.
+
+        Общий роутер живёт внутри ОДНОГО дерева: включение одного
+        роутера в разные диспетчеры не поддерживается (подготовленное
+        состояние хранится на самом роутере, см. ``include_routers``).
+        """
         handled: list[str] = []
+        parent_a = Router("parent_a")
+        parent_b = Router("parent_b")
         shared = Router("shared")
         grandchild = Router("grandchild")
-        other_dp = Dispatcher(router_id="other")
 
         @grandchild.message_created()
         async def _handler(event: MessageCreated):
             handled.append("grandchild")
 
-        dispatcher.include_routers(shared)
-        other_dp.include_routers(shared)
+        parent_a.include_routers(shared)
+        parent_b.include_routers(shared)
+        dispatcher.include_routers(parent_a, parent_b)
 
         await _startup(dispatcher, bot)
-        await _startup(other_dp, bot)
 
-        # Оба диспетчера уже построили свои кеши записей: включение внука
-        # обязано инвалидировать оба снимка, а не только первый.
-        snapshots = (
-            dispatcher._cached_router_entries,
-            other_dp._cached_router_entries,
-        )
-        assert all(snapshot is not None for snapshot in snapshots)
+        assert {id(parent) for parent in shared._parents} == {
+            id(parent_a),
+            id(parent_b),
+        }
+        # Кеш записей уже построен: включение внука обязано пометить
+        # устаревшими обоих родителей и корень.
+        assert dispatcher._cached_router_entries is not None
 
         shared.include_routers(grandchild)
 
+        assert parent_a._handlers_dirty is True
+        assert parent_b._handlers_dirty is True
         assert dispatcher._cached_router_entries is None
-        assert other_dp._cached_router_entries is None
 
         await dispatcher.handle(fixture_message_created)
-        await other_dp.handle(fixture_message_created)
 
-        assert handled == ["grandchild", "grandchild"]
+        assert handled == ["grandchild"]
+
+        # Корень перестроился: следующая инвалидация от того же
+        # ребёнка обязана дойти до него снова (защита от раннего
+        # выхода по флагу _handlers_dirty у детей).
+        assert dispatcher._cached_router_entries is not None
+
+        @grandchild.message_created()
+        async def _second(event: MessageCreated):
+            handled.append("второй")
+
+        assert dispatcher._cached_router_entries is None
+
+        await dispatcher.handle(fixture_message_created)
+
+        assert len(handled) == 2
 
     async def test_unprepared_dispatcher_does_not_read_stale_index(
         self, dispatcher, bot, fixture_message_created

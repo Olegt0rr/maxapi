@@ -47,14 +47,21 @@ CONTEXTS_MAX_SIZE = 10_000
 
 _FilterKwargSpec = tuple[str | None, frozenset[str] | None]
 
-_in_handler: ContextVar[bool] = ContextVar("maxapi_in_handler", default=False)
-"""Признак того, что текущая задача выполняет :meth:`Dispatcher.handle`.
+_in_handler: ContextVar[tuple[Dispatcher, asyncio.Task] | None] = ContextVar(
+    "maxapi_in_handler", default=None
+)
+"""Маркер выполнения :meth:`Dispatcher.handle`: ``(диспетчер, задача)``.
 
 Нужен :meth:`Dispatcher.shutdown`, чтобы распознать реентрантный вызов
 (обработчик остановил диспетчер сам) и не дожидаться задач, которые ждут
-этот же обработчик. Метка наследуется в ``create_task`` и общая для всех
-диспетчеров процесса, поэтому одной её мало: ``shutdown`` дополнительно
-проверяет, что текущая задача принадлежит именно ему.
+этот же обработчик.
+
+Метка наследуется в ``create_task`` и общая для всех диспетчеров
+процесса, поэтому в неё записан не факт «мы в обработчике», а его
+владелец и задача: реентрантен только вызов из ТОЙ ЖЕ задачи и для ТОГО
+ЖЕ диспетчера. Дочерняя задача обработчика метку унаследует, но её
+``current_task()`` другой — для неё ``shutdown`` дренирует пул как
+обычно.
 """
 
 
@@ -180,7 +187,7 @@ class Dispatcher(BotMixin):
         self._polling_error: BaseException | None = None
         self._stop_event: asyncio.Event | None = None
         self._ready: bool = False
-        self._preparing: bool = False
+        self._running_on_started: bool = False
         self._parents: weakref.WeakSet[Dispatcher] = weakref.WeakSet()
         self._handlers_dirty: bool = False
         self._warned_duplicate_routers: weakref.WeakSet[
@@ -338,6 +345,16 @@ class Dispatcher(BotMixin):
         диспетчеризацию лишь при следующей перестройке, вызванной
         другой регистрацией, а добавленный так роутер окажется после
         собственных обработчиков диспетчера. Используйте этот метод.
+
+        Роутер должен принадлежать ОДНОМУ дереву — одному диспетчеру.
+        Включение одного и того же роутера в несколько диспетчеров не
+        поддерживается: подготовленное состояние (``router.bot``,
+        выпеченные цепочки middleware в ``handler.mw_chain``) хранится
+        на самих объектах роутера и обработчиков, и подготовка второго
+        диспетчера перезапишет его для первого — как и ``bot.commands``
+        с ``bot.dispatcher``, которые тоже одни. Внутри одного дерева
+        повторное включение допустимо: обход дедуплицирует роутеры по
+        первому вхождению (и предупреждает о дублях).
 
         Args:
             *routers: Роутеры для добавления.
@@ -529,11 +546,14 @@ class Dispatcher(BotMixin):
         Подготавливает диспетчер: сохраняет бота, подготавливает
         обработчики, вызывает on_started.
 
-        Флаг ``_preparing`` держится взведённым на всё время подготовки,
-        включая вызов ``on_started``: по нему :meth:`Event.register`
-        отличает позднюю регистрацию колбэка (в этом запуске он уже не
-        будет вызван) от регистрации на остановленном диспетчере,
-        которая штатно сработает при следующем запуске.
+        Флаг ``_running_on_started`` взводится ровно на фазу вызова
+        ``on_started`` — непосредственно перед чтением
+        ``on_started_func``. По нему :meth:`Event.register` отличает
+        регистрацию колбэка изнутри самого ``on_started`` (в этом
+        запуске он уже не будет вызван) от регистрации в окне
+        подготовки до этой фазы (``check_me`` и проверка подписок):
+        колбэк, зарегистрированный там, штатно сработает в этом же
+        запуске, и предупреждать о нём не о чем.
 
         Args:
             bot: Экземпляр бота.
@@ -544,47 +564,50 @@ class Dispatcher(BotMixin):
         # подготовку заново, но диспетчер снова принимает события.
         self._closing = False
 
-        self._preparing = True
+        if self._ready:
+            # Регистрации между shutdown() и повторным startup()
+            # должны попасть в индекс сразу: подготовка не
+            # повторяется, а bot.commands обязан быть актуален уже
+            # до первого события.
+            self._ensure_prepared()
+            return
+
+        self.bot = bot
+        self.bot.dispatcher = self
+
+        # Сам диспетчер добавляем в роутеры до сетевых await'ов
+        # ниже: событие, пришедшее в окно подготовки, вызовет
+        # перестройку индекса, и без этого его собственные
+        # обработчики в неё не попадут.
+        if self not in self.routers:
+            self.routers.append(self)
+
+        if self.polling and bot.auto_check_subscriptions:
+            await self._check_subscriptions(bot)
+
+        await self.check_me()
+
+        self._prepare_handlers(bot)
+
+        self._global_mw_chain = self.build_middleware_chain(
+            self.outer_middlewares, self._process_event
+        )
+
+        # Флаг взводим до чтения on_started_func: всё, что
+        # зарегистрировано позже этой точки, в текущем запуске уже не
+        # вызовется.
+        self._running_on_started = True
         try:
-            if self._ready:
-                # Регистрации между shutdown() и повторным startup()
-                # должны попасть в индекс сразу: подготовка не
-                # повторяется, а bot.commands обязан быть актуален уже
-                # до первого события.
-                self._ensure_prepared()
-                return
-
-            self.bot = bot
-            self.bot.dispatcher = self
-
-            # Сам диспетчер добавляем в роутеры до сетевых await'ов
-            # ниже: событие, пришедшее в окно подготовки, вызовет
-            # перестройку индекса, и без этого его собственные
-            # обработчики в неё не попадут.
-            if self not in self.routers:
-                self.routers.append(self)
-
-            if self.polling and bot.auto_check_subscriptions:
-                await self._check_subscriptions(bot)
-
-            await self.check_me()
-
-            self._prepare_handlers(bot)
-
-            self._global_mw_chain = self.build_middleware_chain(
-                self.outer_middlewares, self._process_event
-            )
-
             if self.on_started_func:
                 await self.on_started_func()
-
-            # Регистрации внутри on_started попадают в индекс сразу,
-            # чтобы первое же событие не платило за перестройку.
-            self._ensure_prepared()
-
-            self._ready = True
         finally:
-            self._preparing = False
+            self._running_on_started = False
+
+        # Регистрации внутри on_started попадают в индекс сразу,
+        # чтобы первое же событие не платило за перестройку.
+        self._ensure_prepared()
+
+        self._ready = True
 
     def _prepare_handlers(self, bot: Bot, *, rebuild: bool = False) -> None:
         """Подготовить обработчики событий и построить кеши.
@@ -1679,10 +1702,14 @@ class Dispatcher(BotMixin):
         """
         process_info = "нет данных"
 
-        # Метка «мы внутри обработчика» видна только текущей задаче:
-        # по ней shutdown() распознаёт реентрантный вызов
-        # (обработчик остановил диспетчер сам).
-        token = _in_handler.set(True)
+        # Маркер «эта задача выполняет handle() ЭТОГО диспетчера»:
+        # по нему shutdown() распознаёт реентрантный вызов
+        # (обработчик остановил диспетчер сам). Без задачи в маркере
+        # его не ставим: сравнивать было бы не с чем.
+        current_task = asyncio.current_task()
+        token = _in_handler.set(
+            (self, current_task) if current_task is not None else None
+        )
         try:
             self._ensure_prepared()
 
@@ -2183,17 +2210,16 @@ class Dispatcher(BotMixin):
         для него дренаж откладывается до выхода из цикла и выполняется
         автоматически (см. :meth:`start_polling`).
 
-        Реентрантным считается вызов из задачи ЭТОГО диспетчера,
-        помеченной как выполняющая :meth:`handle`. Кольцо всё же
-        возможно, если обработчик сам дожидается порождённой им
-        задачи, которая вызывает ``shutdown()``.
-
-        Эвристика опознаёт только задачу самого polling-цикла и
-        задачи, поставленные через :meth:`spawn_handle_task`. Если
-        ``handle()`` вызван из собственной задачи пользователя
-        (``asyncio.create_task`` в обход ``spawn_handle_task``),
-        ``shutdown()`` из неё реентрантным не признаётся и пойдёт
-        дренировать пул как обычно.
+        Реентрантным считается вызов из ТОЙ ЖЕ задачи, которая прямо
+        сейчас выполняет :meth:`handle` ЭТОГО диспетчера (маркер
+        ``_in_handler``). Способ запуска обработчика роли не играет:
+        так опознаются и инлайн-обработчик в задаче polling, и задача
+        из :meth:`spawn_handle_task`, и вебхук с
+        ``use_create_task=False``, где ``handle()`` вызывается прямо в
+        задаче HTTP-запроса. Кольцо всё же возможно, если обработчик
+        сам дожидается порождённой им задачи, которая вызывает
+        ``shutdown()``: у дочерней задачи ``current_task()`` другой,
+        и её вызов реентрантным не считается.
 
         Отложенный дренаж (см. выше про инлайн-обработчик) выполняется
         только при выходе из цикла polling. Поэтому ``shutdown()`` из
@@ -2213,15 +2239,18 @@ class Dispatcher(BotMixin):
         """
         self._closing = True
 
-        # Метки «мы внутри handle()» мало: ContextVar наследуется в
-        # create_task и общий для всех диспетчеров процесса. Реентрантен
-        # вызов только из задачи ЭТОГО диспетчера.
+        # Одного признака «мы внутри handle()» мало: ContextVar
+        # наследуется в create_task и общий для всех диспетчеров
+        # процесса. Поэтому в маркере лежит пара (диспетчер, задача):
+        # реентрантен вызов только из той же задачи и для того же
+        # диспетчера.
         current = asyncio.current_task()
-        is_own_task = current is not None and (
-            current in self._background_tasks or current is self._polling_task
+        marker = _in_handler.get()
+        reentrant = (
+            marker is not None and marker[0] is self and marker[1] is current
         )
 
-        if _in_handler.get() and is_own_task:
+        if reentrant:
             if current is self._polling_task:
                 # Инлайн-обработчик (use_create_task=False) выполняется
                 # в самой задаче polling: дренаж и закрытие изоляции
@@ -2460,16 +2489,23 @@ class Event:
         if self.update_type == UpdateType.ON_STARTED:
             # Предупреждаем только тогда, когда колбэк действительно
             # опоздал: подготовка уже пройдена и не сброшена
-            # (``_ready``) либо идёт прямо сейчас (``_preparing`` —
-            # в том числе изнутри самого on_started). После
-            # stop_polling() бот остаётся привязан, но подготовка
-            # сброшена, и следующий start_polling колбэк вызовет —
-            # предупреждать там не о чем.
-            if self.router._ready or self.router._preparing:  # noqa: SLF001
+            # (``_ready``) либо колбэк регистрируют изнутри самого
+            # on_started (``_running_on_started``). Регистрация в
+            # окне подготовки ДО фазы on_started (например из-под
+            # долгого check_me) не опоздала: колбэк будет прочитан и
+            # вызван в этом же запуске. После stop_polling() бот
+            # остаётся привязан, но подготовка сброшена, и следующий
+            # start_polling колбэк вызовет — предупреждать там не о
+            # чем.
+            if (
+                self.router._ready  # noqa: SLF001
+                or self.router._running_on_started  # noqa: SLF001
+            ):
                 logger_dp.warning(
-                    "Колбэк on_started зарегистрирован после подготовки "
-                    "диспетчера: он не будет вызван, подготовка "
-                    "диспетчера уже выполнена или выполняется.",
+                    "Колбэк on_started зарегистрирован слишком поздно: "
+                    "он не будет вызван, подготовка диспетчера уже "
+                    "выполнена либо колбэк регистрируется изнутри "
+                    "самого on_started.",
                 )
             self.router.on_started_func = func_event
 

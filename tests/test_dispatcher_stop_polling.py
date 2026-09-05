@@ -867,6 +867,66 @@ class TestReentrantShutdown:
         assert isolation.closed == 1
         assert _reentrancy_warnings(caplog) == []
 
+    async def test_webhook_inline_stop_is_reentrant(
+        self, polling_bot, fixture_message_created, caplog
+    ):
+        """shutdown() из вебхучного обработчика не дренирует пул.
+
+        При ``use_create_task=False`` вебхук вызывает ``handle()``
+        прямо из задачи HTTP-запроса
+        (:class:`~maxapi.webhook.base.BaseMaxWebhook`). Такая задача
+        не принадлежит ни polling-циклу, ни пулу фоновых задач, но
+        держит блокировку изоляции: дренаж из-под неё замкнул бы
+        кольцо (задача в пуле ждёт эту блокировку) и закрыл изоляцию
+        посреди обработки.
+        """
+        isolation = _CountingIsolation()
+        dispatcher = Dispatcher(event_isolation=isolation)
+        handled: list[str] = []
+        after_shutdown: list[str] = []
+        closed_inside: list[int] = []
+
+        @dispatcher.message_created()
+        async def _handler(event: MessageCreated):
+            if handled:
+                handled.append("фоновый")
+                return
+            handled.append("вебхук")
+            # Задача того же пользователя ждёт блокировку изоляции,
+            # которую держит этот обработчик.
+            dispatcher.spawn_handle_task(event)
+            await _let_tasks_run()
+            await dispatcher.shutdown()
+            # Дренаж пропущен: фоновая задача всё ещё ждёт блокировку,
+            # изоляция не закрыта посреди обработки события.
+            after_shutdown.extend(handled)
+            closed_inside.append(isolation.closed)
+
+        await dispatcher.startup(polling_bot)
+
+        with caplog.at_level("WARNING", logger="dispatcher"):
+            # Имитация вебхука: handle() вызван из обычной задачи.
+            request = asyncio.create_task(
+                dispatcher.handle(fixture_message_created)
+            )
+            await asyncio.wait_for(request, STOP_TIMEOUT)
+
+        assert after_shutdown == ["вебхук"]
+        assert closed_inside == [0]
+        assert isolation.closed == 0
+
+        warnings = _reentrancy_warnings(caplog)
+        assert len(warnings) == 1
+        assert "(1)" in warnings[0]
+
+        # Пропущенная задача доработает сама.
+        await asyncio.wait_for(
+            asyncio.gather(*tuple(dispatcher._background_tasks)),
+            STOP_TIMEOUT,
+        )
+
+        assert handled == ["вебхук", "фоновый"]
+
     async def test_background_stop_warns_about_skipped_drain(
         self, polling_bot, fixture_message_created, caplog
     ):
