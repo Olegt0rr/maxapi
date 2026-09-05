@@ -1,4 +1,4 @@
-include LICENSE.md
+include LICENSE
 include README.md
 recursive-include maxapi py.typed
 recursive-include maxapi/client *.pem
