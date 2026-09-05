@@ -344,6 +344,34 @@ class TestLateMiddlewareAndFilters:
         )
         assert dispatcher.on_started_func is _on_started
 
+    async def test_on_started_registration_inside_on_started_warns(
+        self, dispatcher, bot, caplog
+    ):
+        """Регистрация on_started изнутри самого колбэка предупреждает.
+
+        Подготовка идёт прямо сейчас: новая функция заменит старую, но
+        в этом запуске вызвана уже не будет.
+        """
+        calls: list[str] = []
+
+        @dispatcher.on_started()
+        async def _first():
+            calls.append("первый")
+
+            @dispatcher.on_started()
+            async def _second():
+                calls.append("второй")
+
+        with caplog.at_level("WARNING", logger="dispatcher"):
+            await _startup(dispatcher, bot)
+
+        assert calls == ["первый"]
+        assert dispatcher.on_started_func is not _first
+        assert any(
+            "он не будет вызван" in record.getMessage()
+            for record in caplog.records
+        )
+
     async def test_late_command_handler_extracts_commands(
         self, dispatcher, bot
     ):

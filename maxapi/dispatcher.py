@@ -175,8 +175,12 @@ class Dispatcher(BotMixin):
         self._closing: bool = False
         self._deferred_shutdown: bool = False
         self._polling_task: asyncio.Task | None = None
+        self._polling_active: bool = False
+        self._loop_done: asyncio.Event | None = None
+        self._polling_error: BaseException | None = None
         self._stop_event: asyncio.Event | None = None
         self._ready: bool = False
+        self._preparing: bool = False
         self._parents: weakref.WeakSet[Dispatcher] = weakref.WeakSet()
         self._handlers_dirty: bool = False
         self._warned_duplicate_routers: weakref.WeakSet[
@@ -525,6 +529,12 @@ class Dispatcher(BotMixin):
         Подготавливает диспетчер: сохраняет бота, подготавливает
         обработчики, вызывает on_started.
 
+        Флаг ``_preparing`` держится взведённым на всё время подготовки,
+        включая вызов ``on_started``: по нему :meth:`Event.register`
+        отличает позднюю регистрацию колбэка (в этом запуске он уже не
+        будет вызван) от регистрации на остановленном диспетчере,
+        которая штатно сработает при следующем запуске.
+
         Args:
             bot: Экземпляр бота.
         """
@@ -534,42 +544,47 @@ class Dispatcher(BotMixin):
         # подготовку заново, но диспетчер снова принимает события.
         self._closing = False
 
-        if self._ready:
-            # Регистрации между shutdown() и повторным startup() должны
-            # попасть в индекс сразу: подготовка не повторяется, а
-            # bot.commands обязан быть актуален уже до первого события.
+        self._preparing = True
+        try:
+            if self._ready:
+                # Регистрации между shutdown() и повторным startup()
+                # должны попасть в индекс сразу: подготовка не
+                # повторяется, а bot.commands обязан быть актуален уже
+                # до первого события.
+                self._ensure_prepared()
+                return
+
+            self.bot = bot
+            self.bot.dispatcher = self
+
+            # Сам диспетчер добавляем в роутеры до сетевых await'ов
+            # ниже: событие, пришедшее в окно подготовки, вызовет
+            # перестройку индекса, и без этого его собственные
+            # обработчики в неё не попадут.
+            if self not in self.routers:
+                self.routers.append(self)
+
+            if self.polling and bot.auto_check_subscriptions:
+                await self._check_subscriptions(bot)
+
+            await self.check_me()
+
+            self._prepare_handlers(bot)
+
+            self._global_mw_chain = self.build_middleware_chain(
+                self.outer_middlewares, self._process_event
+            )
+
+            if self.on_started_func:
+                await self.on_started_func()
+
+            # Регистрации внутри on_started попадают в индекс сразу,
+            # чтобы первое же событие не платило за перестройку.
             self._ensure_prepared()
-            return
 
-        self.bot = bot
-        self.bot.dispatcher = self
-
-        # Сам диспетчер добавляем в роутеры до сетевых await'ов ниже:
-        # событие, пришедшее в окно подготовки, вызовет перестройку
-        # индекса, и без этого его собственные обработчики в неё
-        # не попадут.
-        if self not in self.routers:
-            self.routers.append(self)
-
-        if self.polling and bot.auto_check_subscriptions:
-            await self._check_subscriptions(bot)
-
-        await self.check_me()
-
-        self._prepare_handlers(bot)
-
-        self._global_mw_chain = self.build_middleware_chain(
-            self.outer_middlewares, self._process_event
-        )
-
-        if self.on_started_func:
-            await self.on_started_func()
-
-        # Регистрации внутри on_started попадают в индекс сразу,
-        # чтобы первое же событие не платило за перестройку.
-        self._ensure_prepared()
-
-        self._ready = True
+            self._ready = True
+        finally:
+            self._preparing = False
 
     def _prepare_handlers(self, bot: Bot, *, rebuild: bool = False) -> None:
         """Подготовить обработчики событий и построить кеши.
@@ -1950,7 +1965,8 @@ class Dispatcher(BotMixin):
         Запускает цикл получения обновлений (long polling).
 
         Остановить цикл можно методом :meth:`stop_polling`, который
-        дожидается завершения этой задачи.
+        дожидается выхода из самого цикла (а не задачи, вызвавшей этот
+        метод: та может продолжать работу и после возврата отсюда).
 
         Отмена задачи снаружи (``task.cancel()``) корректной остановкой
         не является: цикл прервётся, но фоновые задачи обработчиков
@@ -1960,6 +1976,12 @@ class Dispatcher(BotMixin):
         запуском дождитесь отменённой задачи (``await task`` с
         подавлением ``CancelledError``): пока она не завершилась,
         повторный вызов будет отклонён.
+
+        Запуск считается активным от входа в метод и до конца уборки в
+        ``finally`` — включая отложенный дренаж фоновых задач, который
+        мог остаться от инлайн-обработчика (см. :meth:`shutdown`).
+        Повторный вызов всё это время отклоняется: иначе уборка
+        прошлого запуска закрыла бы изоляцию уже нового цикла.
 
         Ручная остановка через ``dp.polling = False`` (старый идиом)
         оставляет висеть текущий запрос ``get_updates`` до его
@@ -1980,8 +2002,7 @@ class Dispatcher(BotMixin):
         Raises:
             RuntimeError: Если polling на этом диспетчере уже запущен.
         """
-        running = self._polling_task
-        if running is not None and not running.done():
+        if self._polling_active:
             msg = (
                 "Polling уже запущен на этом диспетчере. "
                 "Остановите его через stop_polling() перед новым "
@@ -1989,73 +2010,112 @@ class Dispatcher(BotMixin):
             )
             raise RuntimeError(msg)
 
+        self._polling_active = True
         self.polling = True
         self._polling_task = asyncio.current_task()
         self._stop_event = asyncio.Event()
+        self._polling_error = None
+        # Ожидающие остановки ждут именно это событие, а не задачу
+        # вызывающего: она может продолжаться и после выхода из цикла.
+        loop_done = self._loop_done = asyncio.Event()
 
         try:
-            await self.__ready(bot)
+            try:
+                await self.__ready(bot)
 
-            current_timestamp = to_ms(datetime.now())
+                current_timestamp = to_ms(datetime.now())
 
-            while self.polling:
-                events = await self._fetch_updates_once(bot)
-                if events is None:
-                    # Recoverable-ошибка или остановка: пробуем снова
-                    # (или выходим по условию цикла).
-                    continue
-                if not self.polling:
-                    # Пачку, полученную уже после остановки, не
-                    # обрабатываем: маркер не сдвинут, и эти события
-                    # придут снова при следующем запуске.
-                    continue
-                await self._dispatch_fetched_events(
-                    events, current_timestamp, skip_updates=skip_updates
-                )
+                while self.polling:
+                    events = await self._fetch_updates_once(bot)
+                    if events is None:
+                        # Recoverable-ошибка или остановка: пробуем
+                        # снова (или выходим по условию цикла).
+                        continue
+                    if not self.polling:
+                        # Пачку, полученную уже после остановки, не
+                        # обрабатываем: маркер не сдвинут, и эти события
+                        # придут снова при следующем запуске.
+                        continue
+                    await self._dispatch_fetched_events(
+                        events, current_timestamp, skip_updates=skip_updates
+                    )
+            except BaseException as e:
+                # Ошибку запоминаем для stop_polling: он больше не
+                # дожидается задачи и не может прочитать её exception().
+                # Отмена ошибкой цикла не считается — о ней знает тот,
+                # кто отменял.
+                if not isinstance(e, asyncio.CancelledError):
+                    self._polling_error = e
+                raise
+            finally:
+                self.polling = False
+                self._polling_task = None
+                self._stop_event = None
+                # Остановка могла прийтись на подготовку (__ready): та
+                # дописывает _ready=True уже после сброса в
+                # stop_polling, поэтому сбрасываем здесь — иначе
+                # следующий start_polling молча пропустил бы check_me
+                # и on_started.
+                self._ready = False
+                # Будим ожидающих сразу после выхода из цикла: ждать
+                # отложенного дренажа им нельзя — среди дренируемых
+                # задач может быть та самая, что вызвала stop_polling.
+                loop_done.set()
         finally:
-            self.polling = False
-            self._polling_task = None
-            self._stop_event = None
-            # Остановка могла прийтись на подготовку (__ready): та
-            # дописывает _ready=True уже после сброса в stop_polling,
-            # поэтому сбрасываем здесь — иначе следующий start_polling
-            # молча пропустил бы check_me и on_started.
-            self._ready = False
-
-            if self._deferred_shutdown:
-                # Инлайн-обработчик остановил диспетчер сам: дренаж
-                # был отложен, теперь мы вне handle() и можем дождаться
-                # фоновых задач и закрыть изоляцию. При внешней отмене
-                # задачи (task.cancel()) флаг обычно не выставлен, и
-                # лишнего await здесь нет. Но если инлайн-обработчик
-                # успел взвести флаг, а затем задачу всё же отменили,
-                # отложенный shutdown всё равно выполнится — этот
-                # finally отрабатывает и в процессе отмены.
-                self._deferred_shutdown = False
-                await self.shutdown()
+            try:
+                if self._deferred_shutdown:
+                    # Инлайн-обработчик остановил диспетчер сам: дренаж
+                    # был отложен, теперь мы вне handle() и можем
+                    # дождаться фоновых задач и закрыть изоляцию. При
+                    # внешней отмене задачи (task.cancel()) флаг обычно
+                    # не выставлен, и лишнего await здесь нет. Но если
+                    # инлайн-обработчик успел взвести флаг, а затем
+                    # задачу всё же отменили, отложенный shutdown всё
+                    # равно выполнится — этот finally отрабатывает и в
+                    # процессе отмены.
+                    self._deferred_shutdown = False
+                    await self.shutdown()
+            finally:
+                # Признак активного запуска снимаем последним: до этого
+                # момента повторный start_polling отклоняется, иначе
+                # уборка отсюда задела бы уже новый цикл.
+                self._loop_done = None
+                self._polling_active = False
 
     async def stop_polling(self) -> None:
         """
         Останавливает цикл получения обновлений (long polling).
 
         Прерывает висящий запрос ``get_updates`` и паузы между
-        попытками, после чего дожидается завершения задачи
+        попытками, после чего дожидается выхода из цикла
         :meth:`start_polling` и всех фоновых задач
         (``use_create_task=True``), запущенных до момента остановки.
         После возврата из метода никакой активности диспетчера не
         остаётся.
+
+        Ожидается именно цикл, а не задача, вызвавшая
+        :meth:`start_polling`: при ``await dp.start_polling(bot)``
+        внутри более крупной корутины та задача продолжает работу и
+        после остановки — ждать её означало бы дедлок, если её
+        продолжение ждёт останавливающий обработчик.
 
         Сетевые вызовы этапа старта (``check_me``, проверка подписок) и
         колбэк ``on_started`` не прерываются: остановка дождётся их
         завершения и только потом вернёт управление.
 
         Если метод вызван из обработчика, выполняющегося прямо в
-        задаче polling (``use_create_task=False``), дожидаться её
+        задаче polling (``use_create_task=False``), дожидаться цикла
         нельзя — задача не может дождаться саму себя. В этом случае
         выставляются только флаги, а цикл завершится сразу после
         возврата из обработчика; дренаж фоновых задач и закрытие
         изоляции произойдут сразу после выхода из цикла
         (см. :meth:`shutdown`).
+
+        Отложенного дренажа метод не ждёт: среди дренируемых задач
+        может быть та самая, из которой вызвана остановка. Поэтому
+        сразу после возврата отсюда повторный :meth:`start_polling`
+        ещё может быть отклонён — пока прошлый запуск не доубирал
+        за собой.
 
         Ручная остановка через ``dp.polling = False`` полноценной
         заменой не является: висящий запрос ``get_updates`` не
@@ -2076,20 +2136,23 @@ class Dispatcher(BotMixin):
                 self._stop_event.set()
             logger_dp.info("Останавливаю polling")
 
-        task = self._polling_task
+        loop_done = self._loop_done
         if (
-            task is not None
-            and not task.done()
-            and task is not asyncio.current_task()
+            loop_done is not None
+            and self._polling_task is not asyncio.current_task()
         ):
-            await asyncio.wait({task})
+            await loop_done.wait()
 
             logger_dp.info("Polling остановлен")
 
-            if not task.cancelled() and task.exception() is not None:
+            error = self._polling_error
+            if error is not None:
+                # Забираем ошибку, чтобы конкурентные остановки и
+                # следующие вызовы не повторяли одно сообщение.
+                self._polling_error = None
                 logger_dp.error(
                     "Цикл polling завершился с ошибкой: %r",
-                    task.exception(),
+                    error,
                 )
 
         await self.shutdown()
@@ -2395,11 +2458,18 @@ class Event:
             )
 
         if self.update_type == UpdateType.ON_STARTED:
-            if self.router.bot is not None:
+            # Предупреждаем только тогда, когда колбэк действительно
+            # опоздал: подготовка уже пройдена и не сброшена
+            # (``_ready``) либо идёт прямо сейчас (``_preparing`` —
+            # в том числе изнутри самого on_started). После
+            # stop_polling() бот остаётся привязан, но подготовка
+            # сброшена, и следующий start_polling колбэк вызовет —
+            # предупреждать там не о чем.
+            if self.router._ready or self.router._preparing:  # noqa: SLF001
                 logger_dp.warning(
                     "Колбэк on_started зарегистрирован после подготовки "
                     "диспетчера: он не будет вызван, подготовка "
-                    "диспетчера уже выполнена.",
+                    "диспетчера уже выполнена или выполняется.",
                 )
             self.router.on_started_func = func_event
 
