@@ -62,3 +62,12 @@ jobs:
       - name: Lint GitHub workflows
         run: |
           uvx --from actionlint-py actionlint -color
+
+      # Аудит безопасности workflow: инъекции, лишние права, плавающие
+      # ссылки на actions, известные уязвимые версии (онлайн-проверки
+      # через GH_TOKEN). Политика и исключения — в zizmor.yml.
+      - name: Audit GitHub workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          uvx zizmor --config zizmor.yml --format github .github/workflows/

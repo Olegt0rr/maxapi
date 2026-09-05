@@ -1,0 +1,18 @@
+# Конфигурация zizmor (аудит GitHub Actions workflow), шаг в lint.yml.
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        # Достаточно тега или SHA; плавающие ветки (@master, @release/v1)
+        # запрещены. Переход на hash-pin — отдельным решением.
+        "*": ref-pin
+  artipacked:
+    ignore:
+      # checkout в job publish намеренно сохраняет токен: он нужен
+      # шагу `git push origin "$TAG"`.
+      - publish.yml
+  self-repository:
+    ignore:
+      # Reusable workflows подключаются по документированному `./`;
+      # новый синтаксис самоссылки не даёт ничего сверх этого.
+      - publish.yml
