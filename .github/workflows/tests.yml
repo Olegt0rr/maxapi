@@ -60,16 +60,12 @@ jobs:
         run: |
           # Это библиотека: пользователи ставят её свежей резолюцией,
           # а не нашим uv.lock. Поэтому обе ноги матрицы резолвят
-          # зависимости заново при каждом запуске: `highest` через
-          # --upgrade берёт самые свежие версии в пределах pyproject.toml
-          # и ловит поломку от нового релиза зависимости сразу, а не
-          # через неделю в PR Dependabot. Lock-файл фиксирует только
-          # инструменты (lint, mypy, docs ставятся с --locked).
-          if [ "$RESOLUTION" = "highest" ]; then
-            uv sync --all-groups --resolution highest --upgrade
-          else
-            uv sync --all-groups --resolution "$RESOLUTION"
-          fi
+          # зависимости заново при каждом запуске (--upgrade игнорирует
+          # lock): `highest` ловит поломку от нового релиза зависимости
+          # сразу, а не через неделю в PR Dependabot; `lowest-direct`
+          # проверяет заявленные нижние границы. Lock-файл фиксирует
+          # только инструменты (lint, mypy, docs ставятся с --locked).
+          uv sync --all-groups --resolution "$RESOLUTION" --upgrade
 
       - name: Run unit tests
         run: |
