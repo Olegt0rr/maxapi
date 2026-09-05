@@ -528,16 +528,18 @@ class TestStopPollingSafety:
 
         assert task.done()
 
-    async def test_second_start_polling_is_rejected_while_draining(
+    async def test_second_start_polling_waits_for_deferred_drain(
         self, polling_bot, fixture_message_created
     ):
-        """Повторный старт отклоняется, пока идёт отложенный дренаж.
+        """Повторный старт ждёт, пока идёт отложенный дренаж.
 
         Инлайн-обработчик остановил диспетчер сам, оставив в пуле
         долгую фоновую задачу: цикл уже вышел, но уборка прошлого
         запуска ещё идёт и закрыла бы изоляцию уже нового цикла.
+        Поэтому новый запуск не стартует до конца этой уборки.
         """
-        dispatcher = Dispatcher()
+        isolation = _CountingIsolation()
+        dispatcher = Dispatcher(event_isolation=isolation)
         entered = asyncio.Event()
         release = asyncio.Event()
         handled: list[str] = []
@@ -564,29 +566,105 @@ class TestStopPollingSafety:
             task = asyncio.create_task(dispatcher.start_polling(polling_bot))
             await asyncio.wait_for(entered.wait(), STOP_TIMEOUT)
 
+            # Цикл уже вышел (дренаж идёт в его finally), но уборка
+            # не закончена.
             assert not task.done()
-            with pytest.raises(RuntimeError, match="Polling уже запущен"):
-                # wait_for — страховка от зависания: отказ обязан быть
-                # мгновенным, а не «когда-нибудь» после дренажа.
-                await asyncio.wait_for(
-                    dispatcher.start_polling(polling_bot), STOP_TIMEOUT
-                )
+
+            started = asyncio.Event()
+            polling_bot.get_updates = _hanging_updates(started, [])
+            restarted = asyncio.create_task(
+                dispatcher.start_polling(polling_bot)
+            )
+            await _let_tasks_run()
+
+            # Новый цикл ждёт уборки, а не стартует поверх неё.
+            assert not restarted.done()
+            assert not started.is_set()
+            assert isolation.closed == 0
 
             release.set()
             await asyncio.wait_for(task, STOP_TIMEOUT)
 
+            # Уборка прошлого запуска закрыла изоляцию до того, как
+            # новый цикл начал работать.
+            assert isolation.closed == 1
+
+            await asyncio.wait_for(started.wait(), STOP_TIMEOUT)
+
         assert handled == ["инлайн", "фоновый"]
         assert dispatcher._background_tasks == set()
 
-        # Дренаж завершён — новый запуск снова принимается.
-        started = asyncio.Event()
-        polling_bot.get_updates = _hanging_updates(started, [])
-
-        restarted = asyncio.create_task(dispatcher.start_polling(polling_bot))
-        await asyncio.wait_for(started.wait(), STOP_TIMEOUT)
         await asyncio.wait_for(dispatcher.stop_polling(), STOP_TIMEOUT)
 
         assert restarted.done()
+        assert isolation.closed == 2
+
+    async def test_restart_waits_for_external_stop_cleanup(
+        self, polling_bot, fixture_message_created
+    ):
+        """Новый цикл ждёт, пока внешний stop_polling доубирает.
+
+        Задача A перезапускает polling сразу после возврата из
+        ``start_polling()``, задача B в это время дренирует в
+        ``stop_polling()`` долгую фоновую задачу. Второй цикл не
+        должен начаться раньше, чем B закроет изоляцию: иначе её
+        закрыли бы уже у нового цикла.
+        """
+        isolation = _CountingIsolation()
+        dispatcher = Dispatcher(
+            use_create_task=True, event_isolation=isolation
+        )
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        restarted = asyncio.Event()
+        order: list[str] = []
+
+        @dispatcher.message_created()
+        async def _handler(event: MessageCreated):
+            entered.set()
+            await release.wait()
+
+        async def _restarter():
+            await dispatcher.start_polling(polling_bot)
+            order.append("первый цикл завершён")
+            polling_bot.get_updates = _hanging_updates(restarted, [])
+            await dispatcher.start_polling(polling_bot)
+
+        async def _stopper():
+            await entered.wait()
+            await dispatcher.stop_polling()
+            order.append("уборка завершена")
+
+        polling_bot.get_updates = _updates_once({"updates": [], "marker": 71})
+
+        with patch(
+            "maxapi.dispatcher.process_update_request",
+            new=AsyncMock(return_value=[fixture_message_created]),
+        ):
+            restarter = asyncio.create_task(_restarter())
+            stopper = asyncio.create_task(_stopper())
+
+            await asyncio.wait_for(entered.wait(), STOP_TIMEOUT)
+            await _let_tasks_run()
+
+            # Цикл вышел, A уже вернулась из первого start_polling, но
+            # B всё ещё дренирует фон — второй цикл не начался.
+            assert order == ["первый цикл завершён"]
+            assert not restarted.is_set()
+            assert isolation.closed == 0
+
+            release.set()
+            await asyncio.wait_for(stopper, STOP_TIMEOUT)
+            await asyncio.wait_for(restarted.wait(), STOP_TIMEOUT)
+
+        # Изоляцию закрыла уборка прошлого запуска, а не нового цикла.
+        assert order == ["первый цикл завершён", "уборка завершена"]
+        assert isolation.closed == 1
+
+        await asyncio.wait_for(dispatcher.stop_polling(), STOP_TIMEOUT)
+        await asyncio.wait_for(restarter, STOP_TIMEOUT)
+
+        assert dispatcher._background_tasks == set()
 
     async def test_on_started_registered_after_stop_is_called_on_restart(
         self, dispatcher, polling_bot, caplog
@@ -1068,6 +1146,34 @@ class TestPollingTaskFailures:
         assert cancelled == [True]
         assert dispatcher.polling is False
         assert dispatcher._polling_task is None
+
+    async def test_start_after_external_cancel_is_accepted(
+        self, dispatcher, polling_bot
+    ):
+        """Отмена не оставляет запуск «недоубранным» навсегда.
+
+        Счётчик держателей уборки снимается и в процессе отмены,
+        иначе следующий start_polling ждал бы события, которое уже
+        никто не выставит.
+        """
+        started = asyncio.Event()
+        polling_bot.get_updates = _hanging_updates(started, [])
+
+        task = asyncio.create_task(dispatcher.start_polling(polling_bot))
+        await asyncio.wait_for(started.wait(), STOP_TIMEOUT)
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        restarted = asyncio.Event()
+        polling_bot.get_updates = _hanging_updates(restarted, [])
+
+        task = asyncio.create_task(dispatcher.start_polling(polling_bot))
+        await asyncio.wait_for(restarted.wait(), STOP_TIMEOUT)
+        await asyncio.wait_for(dispatcher.stop_polling(), STOP_TIMEOUT)
+
+        assert task.done()
 
     async def test_external_cancel_leaves_background_to_shutdown(
         self, polling_bot, fixture_message_created

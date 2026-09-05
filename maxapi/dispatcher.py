@@ -188,6 +188,8 @@ class Dispatcher(BotMixin):
         self._deferred_shutdown: bool = False
         self._polling_task: asyncio.Task | None = None
         self._polling_active: bool = False
+        self._lifecycle_holders: int = 0
+        self._cleanup_done: asyncio.Event | None = None
         self._loop_done: asyncio.Event | None = None
         self._polling_error: BaseException | None = None
         self._stop_event: asyncio.Event | None = None
@@ -468,6 +470,11 @@ class Dispatcher(BotMixin):
         Dispatcher — только для событий, попавших хоть в один handler;
         на уровне Router — только для handler этого роутера.
 
+        Регистрация во время обработки события применяется и к нему,
+        если вызов его обработчика ещё не начался: перестройка индекса
+        переприсваивает ``handler.mw_chain``
+        (см. :meth:`_prepare_handlers`).
+
         Args:
             middleware (BaseMiddleware): Middleware.
         """
@@ -626,6 +633,13 @@ class Dispatcher(BotMixin):
         ``startup()`` или перестройка индекса дублировали бы команды.
         Один ``Bot`` на два диспетчера не поддерживается: подготовка
         второго затрёт команды первого.
+
+        Цепочки ``handler.mw_chain`` перестройка переприсваивает, а не
+        версионирует: middleware, зарегистрированная во время обработки
+        события, применится и к нему, если вызов его обработчика ещё не
+        начался. Обходом это не является — цепочка в любом случае
+        полная; снимок цепочек по поколениям потребовал бы копировать
+        каждый ``Handler`` на каждую перестройку.
 
         Args:
             bot: Экземпляр бота.
@@ -2017,13 +2031,19 @@ class Dispatcher(BotMixin):
         либо вызовите :meth:`shutdown` после отмены. Перед новым
         запуском дождитесь отменённой задачи (``await task`` с
         подавлением ``CancelledError``): пока она не завершилась,
-        повторный вызов будет отклонён.
+        повторный вызов будет отклонён или задержан (см. ниже).
 
-        Запуск считается активным от входа в метод и до конца уборки в
-        ``finally`` — включая отложенный дренаж фоновых задач, который
-        мог остаться от инлайн-обработчика (см. :meth:`shutdown`).
-        Повторный вызов всё это время отклоняется: иначе уборка
-        прошлого запуска закрыла бы изоляцию уже нового цикла.
+        Повторный вызов на ЖИВОМ цикле — ``RuntimeError``. Если же цикл
+        уже вышел, но уборка за прошлым запуском ещё идёт — отложенный
+        дренаж фоновых задач от инлайн-обработчика (см.
+        :meth:`shutdown`) или ``shutdown()`` внешнего
+        :meth:`stop_polling`, — вызов не отклоняется, а ждёт её
+        окончания и только затем стартует. Иначе уборка прошлого
+        запуска закрыла бы изоляцию уже нового цикла. Благодаря этому
+        идиома ``while True: await dp.start_polling(bot)`` переживает
+        остановку снаружи. Перезапускать цикл нужно именно снаружи
+        обработчиков: ожидание уборки из задачи, которую эта же уборка
+        дренирует, замкнуло бы кольцо.
 
         Ручная остановка через ``dp.polling = False`` (старый идиом)
         оставляет висеть текущий запрос ``get_updates`` до его
@@ -2042,17 +2062,31 @@ class Dispatcher(BotMixin):
             skip_updates: Флаг, отвечающий за обработку старых событий.
 
         Raises:
-            RuntimeError: Если polling на этом диспетчере уже запущен.
+            RuntimeError: Если цикл polling на этом диспетчере ещё жив.
         """
-        if self._polling_active:
-            msg = (
-                "Polling уже запущен на этом диспетчере. "
-                "Остановите его через stop_polling() перед новым "
-                "запуском либо используйте отдельный Dispatcher."
-            )
-            raise RuntimeError(msg)
+        while True:
+            if self._polling_active:
+                msg = (
+                    "Polling уже запущен на этом диспетчере. "
+                    "Остановите его через stop_polling() перед новым "
+                    "запуском либо используйте отдельный Dispatcher."
+                )
+                raise RuntimeError(msg)
+
+            cleanup_done = self._cleanup_done
+            if cleanup_done is None or self._lifecycle_holders == 0:
+                break
+
+            # Цикл вышел, но за прошлым запуском ещё убирают: ждём,
+            # иначе та уборка закрыла бы изоляцию уже нашего цикла.
+            # После пробуждения проверяем всё заново: пока мы ждали,
+            # старт мог перехватить кто-то другой.
+            logger_dp.debug("Жду окончания уборки за прошлым запуском")
+            await cleanup_done.wait()
 
         self._polling_active = True
+        self._lifecycle_holders += 1
+        self._cleanup_done = asyncio.Event()
         self.polling = True
         self._polling_task = asyncio.current_task()
         self._stop_event = asyncio.Event()
@@ -2099,6 +2133,9 @@ class Dispatcher(BotMixin):
                 # следующий start_polling молча пропустил бы check_me
                 # и on_started.
                 self._ready = False
+                # Цикл больше не жив: с этого момента повторный
+                # start_polling не отклоняется, а ждёт уборки.
+                self._polling_active = False
                 # Будим ожидающих сразу после выхода из цикла: ждать
                 # отложенного дренажа им нельзя — среди дренируемых
                 # задач может быть та самая, что вызвала stop_polling.
@@ -2118,11 +2155,13 @@ class Dispatcher(BotMixin):
                     self._deferred_shutdown = False
                     await self.shutdown()
             finally:
-                # Признак активного запуска снимаем последним: до этого
-                # момента повторный start_polling отклоняется, иначе
-                # уборка отсюда задела бы уже новый цикл.
+                # Держателя уборки отпускаем последним: до этого
+                # момента повторный start_polling ждёт, иначе уборка
+                # отсюда задела бы уже новый цикл. Отпускаем и при
+                # внешней отмене — этот finally отрабатывает и в
+                # процессе отмены, счётчик не залипает.
                 self._loop_done = None
-                self._polling_active = False
+                self._release_lifecycle()
 
     async def stop_polling(self) -> None:
         """
@@ -2153,11 +2192,16 @@ class Dispatcher(BotMixin):
         изоляции произойдут сразу после выхода из цикла
         (см. :meth:`shutdown`).
 
-        Отложенного дренажа метод не ждёт: среди дренируемых задач
-        может быть та самая, из которой вызвана остановка. Поэтому
-        сразу после возврата отсюда повторный :meth:`start_polling`
-        ещё может быть отклонён — пока прошлый запуск не доубирал
-        за собой.
+        Отложенного дренажа (инлайн-остановка) метод не ждёт: среди
+        дренируемых задач может быть та самая, из которой вызвана
+        остановка. Пока эта уборка идёт, повторный
+        :meth:`start_polling` не отклоняется, а ждёт её окончания.
+
+        Зато на время ожидания цикла и собственного ``shutdown()``
+        метод сам удерживает уборку за прошлым запуском: новый
+        :meth:`start_polling` дождётся возврата отсюда и только затем
+        стартует — иначе этот ``shutdown()`` дренировал бы фон и
+        закрывал изоляцию уже нового цикла.
 
         Ручная остановка через ``dp.polling = False`` полноценной
         заменой не является: висящий запрос ``get_updates`` не
@@ -2179,25 +2223,54 @@ class Dispatcher(BotMixin):
             logger_dp.info("Останавливаю polling")
 
         loop_done = self._loop_done
-        if (
-            loop_done is not None
-            and self._polling_task is not asyncio.current_task()
-        ):
-            await loop_done.wait()
+        if self._polling_task is asyncio.current_task():
+            # Инлайн-стоп: дождаться цикла из него самого нельзя.
+            loop_done = None
 
-            logger_dp.info("Polling остановлен")
+        if loop_done is not None:
+            # Держим уборку за прошлым запуском, пока ждём цикл и
+            # дренируем фон. Инлайн-стоп и стоп без запущенного цикла
+            # счётчик не трогают: первый убирает не здесь, а в finally
+            # цикла, второму убирать не за кем.
+            self._lifecycle_holders += 1
 
-            error = self._polling_error
-            if error is not None:
-                # Забираем ошибку, чтобы конкурентные остановки и
-                # следующие вызовы не повторяли одно сообщение.
-                self._polling_error = None
-                logger_dp.error(
-                    "Цикл polling завершился с ошибкой: %r",
-                    error,
-                )
+        try:
+            if loop_done is not None:
+                await loop_done.wait()
 
-        await self.shutdown()
+                logger_dp.info("Polling остановлен")
+
+                error = self._polling_error
+                if error is not None:
+                    # Забираем ошибку, чтобы конкурентные остановки и
+                    # следующие вызовы не повторяли одно сообщение.
+                    self._polling_error = None
+                    logger_dp.error(
+                        "Цикл polling завершился с ошибкой: %r",
+                        error,
+                    )
+
+            await self.shutdown()
+        finally:
+            if loop_done is not None:
+                self._release_lifecycle()
+
+    def _release_lifecycle(self) -> None:
+        """
+        Отпускает держателя уборки за запуском polling.
+
+        Держателей двое: сам :meth:`start_polling` (до конца своего
+        ``finally``, включая отложенный дренаж) и внешний
+        :meth:`stop_polling` (пока ждёт цикл и дренирует фон). Когда
+        последний отпустил, будим :meth:`start_polling`, ожидающий
+        окончания уборки: с этого момента новый цикл может стартовать,
+        не рискуя, что чужой ``shutdown()`` закроет его изоляцию.
+        """
+        self._lifecycle_holders -= 1
+        if self._lifecycle_holders <= 0:
+            self._lifecycle_holders = 0
+            if self._cleanup_done is not None:
+                self._cleanup_done.set()
 
     async def shutdown(self) -> None:
         """
