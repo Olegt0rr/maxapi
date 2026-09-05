@@ -77,9 +77,10 @@ Async Python SDK + bot-фреймворк для мессенджера **MAX** 
 ## Workflows
 
 - Окружение: `uv sync --all-groups` → `source .venv/bin/activate`. Python ≥ 3.10, target — 3.10.
-  Менеджер — **uv**, не pip/poetry. `uv.lock` коммитится: CI ставит зависимости с `--locked`,
-  поэтому после правки `pyproject.toml` обновляйте lock (`uv lock`); плановые обновления
-  зависимостей — `make upgrade` или PR от Dependabot.
+  Менеджер — **uv**, не pip/poetry. `uv.lock` коммитится и фиксирует dev-инструменты: lint,
+  mypy и docs в CI ставятся с `--locked`, поэтому после правки `pyproject.toml` обновляйте
+  lock (`uv lock`). Тесты в CI резолвят зависимости заново (`lowest-direct` и `highest`
+  с `--upgrade`), чтобы ловить поломки от новых релизов зависимостей, как у пользователей.
 - **Git — всегда с `--no-pager`** или через перенаправление (`| cat`), чтобы пагинатор не
   подвешивал выполнение: `git --no-pager log`, `git --no-pager diff`, `git --no-pager branch`, и
   т.д.

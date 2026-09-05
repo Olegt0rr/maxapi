@@ -58,12 +58,15 @@ jobs:
         env:
           RESOLUTION: ${{ matrix.dependency-resolution }}
         run: |
-          # uv.lock зафиксирован в режиме `highest`: там --locked ловит
-          # его рассинхрон с pyproject.toml, а резолюция не запускается
-          # вовсе, поэтому --resolution не нужен. Для `lowest-direct`
-          # резолюция считается заново, lock-файл к ней неприменим.
+          # Это библиотека: пользователи ставят её свежей резолюцией,
+          # а не нашим uv.lock. Поэтому обе ноги матрицы резолвят
+          # зависимости заново при каждом запуске: `highest` через
+          # --upgrade берёт самые свежие версии в пределах pyproject.toml
+          # и ловит поломку от нового релиза зависимости сразу, а не
+          # через неделю в PR Dependabot. Lock-файл фиксирует только
+          # инструменты (lint, mypy, docs ставятся с --locked).
           if [ "$RESOLUTION" = "highest" ]; then
-            uv sync --all-groups --locked
+            uv sync --all-groups --resolution highest --upgrade
           else
             uv sync --all-groups --resolution "$RESOLUTION"
           fi
