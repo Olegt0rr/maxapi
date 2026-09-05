@@ -673,6 +673,57 @@ class TestInvalidation:
         # с mw_chain=None и глобальная inner-middleware потерялась бы.
         assert log == ["inner", "handler"]
 
+    async def test_dispatch_uses_index_snapshot_taken_at_start(
+        self, dispatcher, bot, fixture_message_created
+    ):
+        """Хендлер, добавленный во время диспетчеризации, в неё не попадает.
+
+        Иначе она увидела бы его через линейный скан ``event_handlers``
+        и выполнила бы с ``mw_chain=None``, минуя inner-middleware.
+        """
+        log: list[str] = []
+        router = Router("slow")
+        reached = asyncio.Event()
+        gate = asyncio.Event()
+
+        class GateFilter(BaseFilter):
+            """Базовый фильтр роутера, удерживающий диспетчеризацию."""
+
+            async def __call__(self, event) -> bool:
+                reached.set()
+                await gate.wait()
+                return True
+
+        router.filter(GateFilter())
+
+        @router.message_created(BlockFilter())
+        async def _narrow(event: MessageCreated):
+            log.append("narrow")
+
+        dispatcher.register_inner_middleware(TrackingMW("inner", log))
+        dispatcher.include_routers(router)
+        await _startup(dispatcher, bot)
+
+        task = asyncio.create_task(dispatcher.handle(fixture_message_created))
+        await reached.wait()
+
+        @router.message_created()
+        async def _late(event: MessageCreated):
+            log.append("late")
+
+        gate.set()
+        await task
+
+        # Снимок индекса, с которым диспетчеризация стартовала, знает
+        # только про _narrow, а тот заблокирован своим фильтром.
+        assert log == []
+
+        # Следующее событие видит нового хендлера — и уже с
+        # выпеченной цепочкой inner-middleware.
+        await dispatcher.handle(fixture_message_created)
+
+        assert log == ["inner", "late"]
+
     async def test_invalidation_with_router_cycle_does_not_hang(
         self, dispatcher, bot, fixture_message_created
     ):

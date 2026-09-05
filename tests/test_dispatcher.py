@@ -799,13 +799,17 @@ class TestHandlePipeline:
         gen = dispatcher._iter_dispatch_entries()
         assert isinstance(gen, types.GeneratorType)
 
-        # Генератор выдаёт кортежи (router, outer_mw, filters, base_filters)
+        # Генератор выдаёт кортежи
+        # (router, outer_mw, filters, base_filters, handlers_index)
         entries = list(gen)
         assert len(entries) >= 1
-        _router, outer_mw, filters, base_filters = entries[0]
+        _router, outer_mw, filters, base_filters, index = entries[0]
         assert isinstance(outer_mw, list)
         assert isinstance(filters, list)
         assert isinstance(base_filters, list)
+        # На ленивом пути снимок индекса не передаётся: чужой индекс
+        # читать нельзя, обработчики ищутся линейным сканом.
+        assert index is None
 
     async def test_not_ready_does_not_cache_entries(
         self, dispatcher, bot, fixture_message_created
@@ -1128,7 +1132,7 @@ class TestDispatcherHelpers:
             dp_module.CONTEXTS_MAX_SIZE = original
 
     def test_find_matching_handlers_without_index(self, dispatcher):
-        """Fallback на линейный поиск когда handlers_by_type не построен."""
+        """Fallback на линейный поиск, когда снимок индекса не передан."""
         router = Router(router_id="r1")
 
         @router.message_created()
@@ -1138,9 +1142,26 @@ class TestDispatcherHelpers:
         router.handlers_by_type = None  # индекс не построен
 
         result = dispatcher._find_matching_handlers(
-            router, UpdateType.MESSAGE_CREATED
+            router, UpdateType.MESSAGE_CREATED, None
         )
         assert len(result) == 1
+
+    def test_find_matching_handlers_uses_snapshot(self, dispatcher):
+        """Используется переданный снимок, а не живой индекс роутера."""
+        router = Router(router_id="r1")
+
+        @router.message_created()
+        async def _handler(event: MessageCreated):
+            logger.debug("Получено событие: %s", event)
+
+        snapshot = {UpdateType.MESSAGE_CREATED: list(router.event_handlers)}
+        # Роутер уже переиндексирован: живой индекс пуст.
+        router.handlers_by_type = {}
+
+        result = dispatcher._find_matching_handlers(
+            router, UpdateType.MESSAGE_CREATED, snapshot
+        )
+        assert result == snapshot[UpdateType.MESSAGE_CREATED]
 
     async def test_check_handler_match_state_mismatch(
         self, dispatcher, fixture_message_created

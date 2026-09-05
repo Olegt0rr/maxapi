@@ -47,6 +47,21 @@ CONTEXTS_MAX_SIZE = 10_000
 
 _FilterKwargSpec = tuple[str | None, frozenset[str] | None]
 
+_DispatchEntry = tuple[
+    "Router | Dispatcher",
+    "list[BaseMiddleware]",
+    "list[MagicFilter]",
+    "list[BaseFilter]",
+    "dict[UpdateType, list[Handler]] | None",
+]
+"""Запись дерева роутеров для диспетчеризации.
+
+``(роутер, outer-middleware, MagicFilter, BaseFilter, снимок индекса)``.
+Последний элемент — ``router.handlers_by_type`` на момент построения
+записи либо ``None`` для ленивого пути (см.
+:meth:`Dispatcher._iter_dispatch_entries`).
+"""
+
 _in_handler: ContextVar[tuple[Dispatcher, asyncio.Task] | None] = ContextVar(
     "maxapi_in_handler", default=None
 )
@@ -166,17 +181,7 @@ class Dispatcher(BotMixin):
         self.on_started_func: Callable | None = None
         self.polling = False
         self.use_create_task = use_create_task
-        self._cached_router_entries: (
-            list[
-                tuple[
-                    Router | Dispatcher,
-                    list[BaseMiddleware],
-                    list[MagicFilter],
-                    list[BaseFilter],
-                ]
-            ]
-            | None
-        ) = None
+        self._cached_router_entries: list[_DispatchEntry] | None = None
         self._global_mw_chain: HandlerCallable | None = None
         self._background_tasks: set[asyncio.Task] = set()
         self._closing: bool = False
@@ -385,10 +390,14 @@ class Dispatcher(BotMixin):
         перестраивается лениво, перед следующей диспетчеризацией
         (см. :meth:`_ensure_prepared`).
 
-        Вместе с кешем записей сбрасывается и ``handlers_by_type``:
-        иначе неподготовленный диспетчер (``bot is None``) на ленивом
-        пути читал бы устаревший индекс роутера, построенный другим
-        диспетчером.
+        ``handlers_by_type`` при этом НЕ сбрасывается: уже начатая
+        диспетчеризация обязана доработать на том индексе, с которым
+        стартовала. Иначе она провалилась бы на линейный скан
+        ``event_handlers`` и выполнила бы только что зарегистрированный
+        обработчик с ``mw_chain=None``, минуя inner-middleware. Новый
+        индекс публикуется целиком в :meth:`_prepare_handlers`, а
+        ленивый путь чужой индекс не читает вовсе
+        (см. :meth:`_iter_dispatch_entries`).
 
         Args:
             _seen: Идентификаторы уже посещённых роутеров. Защищает от
@@ -405,7 +414,6 @@ class Dispatcher(BotMixin):
 
         self._handlers_dirty = True
         self._cached_router_entries = None
-        self.handlers_by_type = None
 
         for parent in self._parents:
             parent._invalidate_handlers(seen)  # noqa: SLF001
@@ -634,7 +642,7 @@ class Dispatcher(BotMixin):
             self.routers, warn_duplicates=True
         ):
             router.bot = bot
-            router.handlers_by_type = {}
+            handlers_index: dict[UpdateType, list[Handler]] = {}
 
             for handler in router.event_handlers:
                 handlers_count += 1
@@ -653,9 +661,13 @@ class Dispatcher(BotMixin):
                     all_inner,
                     functools.partial(self.call_handler, handler),
                 )
-                router.handlers_by_type.setdefault(
-                    handler.update_type, []
-                ).append(handler)
+                handlers_index.setdefault(handler.update_type, []).append(
+                    handler
+                )
+
+            # Публикация одним присваиванием: диспетчеризации,
+            # начатые со старым индексом, продолжают видеть его.
+            router.handlers_by_type = handlers_index
 
             for error_handler in router.error_handlers:
                 error_handler.func_args = frozenset(
@@ -674,16 +686,7 @@ class Dispatcher(BotMixin):
                 "Зарегистрировано %d обработчиков событий", handlers_count
             )
 
-    def _iter_dispatch_entries(
-        self,
-    ) -> Iterator[
-        tuple[
-            Router | Dispatcher,
-            list[BaseMiddleware],
-            list[MagicFilter],
-            list[BaseFilter],
-        ]
-    ]:
+    def _iter_dispatch_entries(self) -> Iterator[_DispatchEntry]:
         """Ленивый генератор entries для dispatch.
 
         Используется, когда кеша записей нет
@@ -692,8 +695,11 @@ class Dispatcher(BotMixin):
         остановить обход дерева роутеров сразу после первого
         совпадения, не аллоцируя полный список. Inner-middleware на
         этом пути могут быть ещё не выпечены в ``handler.mw_chain``
-        (это делает :meth:`_prepare_handlers`), поэтому в кортеж
-        попадают только ``(router, outer_mw, filters, base_filters)``.
+        (это делает :meth:`_prepare_handlers`), поэтому снимок индекса
+        в записи всегда ``None``: подходящие обработчики ищутся
+        линейным сканом ``event_handlers``. Так неподготовленный
+        диспетчер не читает индекс роутера, построенный другим
+        диспетчером.
         """
         for (
             router,
@@ -702,18 +708,9 @@ class Dispatcher(BotMixin):
             filters,
             base_filters,
         ) in self._iter_unique_routers(self.routers):
-            yield router, outer_mw, filters, base_filters
+            yield router, outer_mw, filters, base_filters, None
 
-    def _build_dispatch_entries(
-        self,
-    ) -> list[
-        tuple[
-            Router | Dispatcher,
-            list[BaseMiddleware],
-            list[MagicFilter],
-            list[BaseFilter],
-        ]
-    ]:
+    def _build_dispatch_entries(self) -> list[_DispatchEntry]:
         """Материализует полный список entries для кеша горячего пути.
 
         Вызывается на каждой подготовке обработчиков
@@ -721,8 +718,22 @@ class Dispatcher(BotMixin):
         ``_cached_router_entries`` и используется, пока индекс не
         инвалидирован. Пока кеша нет, работает
         :meth:`_iter_dispatch_entries`.
+
+        В каждую запись кладётся снимок ``router.handlers_by_type`` —
+        просто ссылка на текущий dict. Диспетчеризация работает с ним
+        до самого конца, поэтому поздняя регистрация не подсунет ей
+        обработчик без выпеченной цепочки inner-middleware.
         """
-        return list(self._iter_dispatch_entries())
+        return [
+            (router, outer_mw, filters, base_filters, router.handlers_by_type)
+            for (
+                router,
+                outer_mw,
+                filters,
+                base_filters,
+                _index,
+            ) in self._iter_dispatch_entries()
+        ]
 
     @staticmethod
     async def _check_subscriptions(bot: Bot) -> None:
@@ -1106,21 +1117,29 @@ class Dispatcher(BotMixin):
 
     @staticmethod
     def _find_matching_handlers(
-        router: Router | Dispatcher, event_type: UpdateType
+        router: Router | Dispatcher,
+        event_type: UpdateType,
+        handlers_index: dict[UpdateType, list[Handler]] | None,
     ) -> list[Handler]:
         """
         Находит обработчики, соответствующие типу события в роутере.
 
+        Индекс приходит снимком из записи дерева роутеров, а не читается
+        из ``router.handlers_by_type``: за время диспетчеризации роутер
+        мог получить новый индекс, а начатая обработка обязана видеть
+        только тот, с которым стартовала.
+
         Args:
             router: Роутер для поиска.
             event_type: Тип события.
+            handlers_index: Снимок индекса роутера. При ``None``
+                (ленивый путь) выполняется линейный скан обработчиков.
 
         Returns:
             List[Handler]: Список подходящих обработчиков.
         """
-        index = router.handlers_by_type
-        if index is not None:
-            return index.get(event_type, [])
+        if handlers_index is not None:
+            return handlers_index.get(event_type, [])
 
         return [
             handler
@@ -1241,15 +1260,16 @@ class Dispatcher(BotMixin):
         """
         self._ensure_prepared()
 
-        entries = (
+        entries: Iterable[_DispatchEntry] = (
             self._cached_router_entries
             if self._cached_router_entries is not None
-            else self._iter_unique_routers(self.routers)
+            else self._iter_dispatch_entries()
         )
-        for router, *_ in entries:
+        for router, *_, handlers_index in entries:
             matching_handlers = self._find_matching_handlers(
                 router=router,
                 event_type=event_type,
+                handlers_index=handlers_index,
             )
             for handler in matching_handlers:
                 try:
@@ -1410,14 +1430,7 @@ class Dispatcher(BotMixin):
         """
         router_id = None
 
-        entries: Iterable[
-            tuple[
-                Router | Dispatcher,
-                list[BaseMiddleware],
-                list[MagicFilter],
-                list[BaseFilter],
-            ]
-        ]
+        entries: Iterable[_DispatchEntry]
         # Страховка: между _ensure_prepared() в handle() и этим местом
         # есть await'ы, за которые могла случиться новая регистрация.
         self._ensure_prepared()
@@ -1432,6 +1445,7 @@ class Dispatcher(BotMixin):
             router_outer_middlewares,
             router_filters,
             router_base_filters,
+            handlers_index,
         ) in entries:
             router_id = router.router_id or id(router)
 
@@ -1448,6 +1462,7 @@ class Dispatcher(BotMixin):
             matching_handlers = self._find_matching_handlers(
                 router=router,
                 event_type=event_object.update_type,
+                handlers_index=handlers_index,
             )
             if not matching_handlers:
                 continue
