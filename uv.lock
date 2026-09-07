@@ -3,7 +3,9 @@ revision = 3
 requires-python = ">=3.10"
 resolution-markers = [
     "python_full_version >= '3.15'",
-    "python_full_version >= '3.12' and python_full_version < '3.15'",
+    "python_full_version == '3.14.*'",
+    "python_full_version == '3.13.*'",
+    "python_full_version == '3.12.*'",
     "python_full_version < '3.12'",
 ]
 
@@ -1513,13 +1515,14 @@ dev = [
 requires-dist = [
     { name = "aiofiles", specifier = ">=24.1,<26" },
     { name = "aiohttp", specifier = ">=3.13,<4" },
-    { name = "backoff", specifier = ">=2.0,<3" },
+    { name = "backoff", specifier = ">=2.2,<3" },
     { name = "fastapi", marker = "extra == 'fastapi'", specifier = ">=0.103.0,<1" },
-    { name = "litestar", marker = "extra == 'litestar'", specifier = ">=2.0.0,<3" },
-    { name = "magic-filter", specifier = ">=1.0.0,<2" },
+    { name = "litestar", marker = "python_full_version >= '3.12' and extra == 'litestar'", specifier = ">=2.3.0,<3" },
+    { name = "litestar", marker = "python_full_version < '3.12' and extra == 'litestar'", specifier = ">=2.0.0,<3" },
+    { name = "magic-filter", specifier = ">=1.0.4,<2" },
     { name = "maxapi", extras = ["fastapi"], marker = "extra == 'webhook'" },
     { name = "puremagic", specifier = ">=1.30,<2" },
-    { name = "pydantic", specifier = ">=2,<3" },
+    { name = "pydantic", specifier = ">=2.12,<3" },
     { name = "uvicorn", marker = "extra == 'fastapi'", specifier = ">=0.15.0,<1" },
     { name = "uvicorn", marker = "extra == 'litestar'", specifier = ">=0.15.0,<1" },
 ]
@@ -1536,7 +1539,7 @@ dev = [
     { name = "aresponses", specifier = ">=3.0.0,<4" },
     { name = "coverage", specifier = ">=7.13" },
     { name = "faker", specifier = ">=40.4.0" },
-    { name = "httpx", specifier = ">=0.28.1,<1" },
+    { name = "httpx", specifier = ">=0.27,<1" },
     { name = "maxapi", extras = ["fastapi", "litestar"] },
     { name = "mkdocs", specifier = ">=1.6.1,<2.0.0" },
     { name = "mkdocs-material", specifier = ">=9.7.1" },

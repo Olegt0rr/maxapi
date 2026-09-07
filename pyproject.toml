@@ -16,9 +16,13 @@ classifiers = [
 ]
 dependencies = [
     "aiohttp>=3.13,<4",
-    "backoff>=2.0,<3",
-    "magic_filter>=1.0.0,<2",
-    "pydantic>=2,<3",
+    # Нижние границы проверяются ногой lowest-direct в CI:
+    # backoff 2.2 — details["exception"] в on_backoff; magic_filter 1.0.4 —
+    # MagicT; pydantic 2.12 — сериализация computed-поля url поверх alias
+    # (и первые wheel-ы pydantic-core под Python 3.14).
+    "backoff>=2.2,<3",
+    "magic_filter>=1.0.4,<2",
+    "pydantic>=2.12,<3",
     "aiofiles>=24.1,<26",
     "puremagic>=1.30,<2",
 ]
@@ -42,7 +46,9 @@ fastapi = [
     "uvicorn>=0.15.0,<1",
 ]
 litestar = [
-    "litestar>=2.0.0,<3",
+    # litestar < 2.3 несовместим с logging.config Python 3.12+.
+    "litestar>=2.0.0,<3; python_version < '3.12'",
+    "litestar>=2.3.0,<3; python_version >= '3.12'",
     "uvicorn>=0.15.0,<1",
 ]
 # алиас для обратной совместимости с maxapi[webhook]
@@ -65,7 +71,9 @@ dev = [
     "pymdown-extensions>=10.21",
     "python-dotenv>=1.2.1",
     "Faker>=40.4.0",
-    "httpx>=0.28.1,<1",
+    # httpx 0.28 убрал app= в Client: TestClient старых fastapi/litestar
+    # (нижние границы extras) с ним не работает.
+    "httpx>=0.27,<1",
     "aresponses>=3.0.0,<4",
 ]
 
