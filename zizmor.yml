@@ -6,11 +6,6 @@ rules:
         # Достаточно тега или SHA; ссылки на ветки запрещены.
         # Переход на hash-pin — отдельным решением.
         "*": ref-pin
-  artipacked:
-    ignore:
-      # checkout в job publish намеренно сохраняет токен: он нужен
-      # шагу `git push origin "$TAG"`.
-      - publish.yml
   self-repository:
     ignore:
       # Reusable workflows подключаются по документированному `./`;

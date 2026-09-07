@@ -40,14 +40,11 @@ jobs:
         with:
           version: "latest"
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
+      # Группа ci: actionlint и zizmor зафиксированы в uv.lock,
+      # обновляются через Dependabot, а не «что сегодня в PyPI».
       - name: Install dependencies
         run: |
-          uv sync --all-groups --locked
+          uv sync --group dev --group ci --locked
 
       - name: Run ruff check
         run: |
@@ -61,7 +58,7 @@ jobs:
       # shellcheck по блокам `run`.
       - name: Lint GitHub workflows
         run: |
-          uvx --from actionlint-py actionlint -color
+          uv run actionlint -color
 
       # Аудит безопасности workflow: инъекции, лишние права, плавающие
       # ссылки на actions, известные уязвимые версии (онлайн-проверки
@@ -70,4 +67,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          uvx zizmor --config zizmor.yml --format github .github/workflows/
+          uv run zizmor --config zizmor.yml --format github .github/workflows/

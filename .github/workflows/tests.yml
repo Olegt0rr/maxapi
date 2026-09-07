@@ -12,6 +12,8 @@ on:
         required: false
       TEST_CHAT_ID:
         required: false
+      CODECOV_TOKEN:
+        required: false
 
 permissions:
   contents: read
@@ -37,6 +39,11 @@ jobs:
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
         dependency-resolution: ["lowest-direct", "highest"]
+    env:
+      # Версия из матрицы задаётся uv напрямую: UV_PYTHON перебивает
+      # закоммиченный .python-version (3.10), из-за которого раньше все
+      # ноги матрицы фактически выполнялись на 3.10.
+      UV_PYTHON: ${{ matrix.python-version }}
 
     steps:
       - name: Checkout repository
@@ -49,11 +56,6 @@ jobs:
         with:
           version: "latest"
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
       - name: Install dependencies with ${{ matrix.dependency-resolution }} resolution
         env:
           RESOLUTION: ${{ matrix.dependency-resolution }}
@@ -65,13 +67,18 @@ jobs:
           # сразу, а не через неделю в PR Dependabot; `lowest-direct`
           # проверяет заявленные нижние границы. Lock-файл фиксирует
           # только инструменты (lint, mypy, docs ставятся с --locked).
-          uv sync --all-groups --resolution "$RESOLUTION" --upgrade
+          uv sync --group dev --resolution "$RESOLUTION" --upgrade
 
       - name: Run unit tests
         run: |
           uv run pytest tests/ -v -m "not integration" --cov=maxapi --cov-report=xml --cov-report=term
 
+      # Один общий токен бота: гоняем на одной ноге, иначе десять
+      # параллельных прогонов упираются в лимиты реального API.
       - name: Run integration tests
+        if: >-
+          ${{ matrix.python-version == '3.11'
+          && matrix.dependency-resolution == 'highest' }}
         env:
           MAX_BOT_TOKEN: ${{ secrets.MAX_BOT_TOKEN }}
           TEST_CHAT_ID: ${{ secrets.TEST_CHAT_ID }}
@@ -82,11 +89,16 @@ jobs:
             echo "MAX_BOT_TOKEN не установлен, пропускаем интеграционные тесты"
           fi
 
+      # Токен убирает флаки tokenless-загрузки; в PR из форков секрета
+      # нет, и action сам откатывается на tokenless для public repo.
       - name: Upload coverage to Codecov
-        if: matrix.python-version == '3.11'
+        if: >-
+          ${{ matrix.python-version == '3.11'
+          && matrix.dependency-resolution == 'highest' }}
         uses: codecov/codecov-action@v4
         with:
-          file: ./coverage.xml
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage.xml
           fail_ci_if_error: false
           flags: unittests
           name: codecov-umbrella

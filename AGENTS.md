@@ -86,6 +86,8 @@ Async Python SDK + bot-фреймворк для мессенджера **MAX** 
   т.д.
 - Полная проверка перед PR: `make run-test` — параллельно запускает `ruff check .`,
   `ruff format . --check`, `mypy maxapi`, `pytest -q`. Форматирование — `make format`.
+  `make check-ci` — остальное, что проверяет CI: сборка пакета (`twine check`,
+  `check-wheel-contents`), `actionlint` и `zizmor` по workflow; инструменты — группа `ci`.
 - Тесты: `pytest -q [tests/test_X.py]`. `asyncio_mode = "auto"` — async-тесты не нуждаются в
   декораторах. Маркер `@pytest.mark.integration` автоматически пропускается без `MAX_BOT_TOKEN` в
   env (см. `tests/conftest.py::pytest_collection_modifyitems`). Фикстуры событий —

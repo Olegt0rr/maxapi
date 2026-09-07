@@ -20,6 +20,17 @@ run-test:
 	exit $$status
 
 
+# Проверки CI, которых нет в run-test: сборка пакета, workflow.
+.PHONY: check-ci
+check-ci:
+	rm -rf dist
+	uv build
+	uv run --group ci twine check dist/*
+	uv run --group ci check-wheel-contents dist/*.whl
+	uv run --group ci actionlint
+	uv run --group ci zizmor --config zizmor.yml .github/workflows/
+
+
 .PHONY: format
 format:
 	@echo "Running ruff formatter..."

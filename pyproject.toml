@@ -69,6 +69,14 @@ dev = [
     "aresponses>=3.0.0,<4",
 ]
 
+# Инструменты CI: зафиксированы в uv.lock, обновляются через Dependabot.
+ci = [
+    "actionlint-py>=1.7",
+    "zizmor>=1.0",
+    "twine>=6.0",
+    "check-wheel-contents>=0.6",
+]
+
 [tool.uv]
 # Enable uv project management and include `dev` group by default when running/syncing
 default-groups = ["dev"]

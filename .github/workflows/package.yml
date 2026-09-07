@@ -40,10 +40,10 @@ jobs:
         with:
           version: "latest"
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+      # Только группа ci: twine и check-wheel-contents из uv.lock.
+      - name: Install tools
+        run: |
+          uv sync --only-group ci --locked
 
       - name: Build sdist and wheel
         run: |
@@ -51,13 +51,13 @@ jobs:
 
       - name: Check package metadata
         run: |
-          uvx twine check dist/*
+          uv run twine check dist/*
 
       # Ловит лишние top-level пакеты в wheel (например, examples/),
       # которые после установки засоряют site-packages пользователя.
       - name: Check wheel contents
         run: |
-          uvx check-wheel-contents dist/*.whl
+          uv run check-wheel-contents dist/*.whl
 
       # Артефакт забирает job publish из publish.yml, чтобы на PyPI
       # ушло ровно то, что проверено здесь, без пересборки.
