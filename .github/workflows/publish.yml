@@ -212,9 +212,13 @@ jobs:
         run: |
           TAG="v$VERSION"
 
-          if gh api "repos/$GH_REPO/git/ref/tags/$TAG" >/dev/null 2>&1; then
+          # 404 — тега нет, создаём; любая другая ошибка API — падаем.
+          if out=$(gh api "repos/$GH_REPO/git/ref/tags/$TAG" 2>&1); then
             echo "Tag $TAG already exists, skipping."
             exit 0
+          elif ! grep -q "HTTP 404" <<<"$out"; then
+            echo "$out" >&2
+            exit 1
           fi
 
           gh api "repos/$GH_REPO/git/refs" \

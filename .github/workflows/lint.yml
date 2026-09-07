@@ -48,17 +48,17 @@ jobs:
 
       - name: Run ruff check
         run: |
-          uv run ruff check .
+          uv run --no-sync ruff check .
 
       - name: Run ruff format check
         run: |
-          uv run ruff format . --check
+          uv run --no-sync ruff format . --check
 
       # Проверяет сами workflow: синтаксис, контексты выражений и
       # shellcheck по блокам `run`.
       - name: Lint GitHub workflows
         run: |
-          uv run actionlint -color
+          uv run --no-sync actionlint -color
 
       # Аудит безопасности workflow: инъекции, лишние права, плавающие
       # ссылки на actions, известные уязвимые версии (онлайн-проверки
@@ -67,4 +67,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          uv run zizmor --config zizmor.yml --format github .github/workflows/
+          uv run --no-sync zizmor --config zizmor.yml --format github \
+            .github/workflows/

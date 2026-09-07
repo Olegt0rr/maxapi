@@ -76,7 +76,8 @@ Async Python SDK + bot-фреймворк для мессенджера **MAX** 
 
 ## Workflows
 
-- Окружение: `uv sync --all-groups` → `source .venv/bin/activate`. Python ≥ 3.10, target — 3.10.
+- Окружение: `uv sync` (группа `dev` ставится по умолчанию) → `source .venv/bin/activate`.
+  Python ≥ 3.10, target — 3.10.
   Менеджер — **uv**, не pip/poetry. `uv.lock` коммитится и фиксирует dev-инструменты: lint,
   mypy и docs в CI ставятся с `--locked`, поэтому после правки `pyproject.toml` обновляйте
   lock (`uv lock`). Тесты в CI резолвят зависимости заново (`lowest-direct` и `highest`
@@ -88,6 +89,8 @@ Async Python SDK + bot-фреймворк для мессенджера **MAX** 
   `ruff format . --check`, `mypy maxapi`, `pytest -q`. Форматирование — `make format`.
   `make check-ci` — остальное, что проверяет CI: сборка пакета (`twine check`,
   `check-wheel-contents`), `actionlint` и `zizmor` по workflow; инструменты — группа `ci`.
+  Обе цели запускают `uv run --locked`: рассинхрон `uv.lock` с `pyproject.toml` валит их,
+  как и CI. Онлайн-аудиты zizmor берут токен из `gh auth token`, если `gh` авторизован.
 - Тесты: `pytest -q [tests/test_X.py]`. `asyncio_mode = "auto"` — async-тесты не нуждаются в
   декораторах. Маркер `@pytest.mark.integration` автоматически пропускается без `MAX_BOT_TOKEN` в
   env (см. `tests/conftest.py::pytest_collection_modifyitems`). Фикстуры событий —

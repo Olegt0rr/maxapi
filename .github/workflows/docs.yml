@@ -57,7 +57,7 @@ jobs:
       # файл) валит сборку, в том числе на pull_request.
       - name: Build with MkDocs
         run: |
-          uv run mkdocs build --strict
+          uv run --no-sync mkdocs build --strict
 
       - name: Upload artifact
         if: >-

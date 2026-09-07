@@ -40,7 +40,8 @@ jobs:
         with:
           version: "latest"
 
-      # Только группа ci: twine и check-wheel-contents из uv.lock.
+      # Только группа ci: twine и check-wheel-contents из uv.lock. Дальше
+      # везде `uv run --no-sync`, иначе uv доустановит dev-группу и проект.
       - name: Install tools
         run: |
           uv sync --only-group ci --locked
@@ -51,13 +52,13 @@ jobs:
 
       - name: Check package metadata
         run: |
-          uv run twine check dist/*
+          uv run --no-sync twine check dist/*
 
       # Ловит лишние top-level пакеты в wheel (например, examples/),
       # которые после установки засоряют site-packages пользователя.
       - name: Check wheel contents
         run: |
-          uv run check-wheel-contents dist/*.whl
+          uv run --no-sync check-wheel-contents dist/*.whl
 
       # Артефакт забирает job publish из publish.yml, чтобы на PyPI
       # ушло ровно то, что проверено здесь, без пересборки.
