@@ -2,9 +2,9 @@ name: Tests
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main]
   pull_request:
-    branches: [main, develop]
+    branches: [main]
   workflow_dispatch:
   workflow_call:
     secrets:
@@ -69,9 +69,13 @@ jobs:
           # только инструменты (lint, mypy, docs ставятся с --locked).
           uv sync --group dev --resolution "$RESOLUTION" --upgrade
 
+      # --no-sync обязателен: без него `uv run` молча приводит окружение
+      # к uv.lock и подменяет установленную выше резолюцию версиями
+      # из lock-файла — нога lowest-direct перестаёт что-либо проверять.
       - name: Run unit tests
         run: |
-          uv run pytest tests/ -v -m "not integration" --cov=maxapi --cov-report=xml --cov-report=term
+          uv run --no-sync pytest tests/ -v -m "not integration" \
+            --cov=maxapi --cov-report=xml --cov-report=term
 
       # Один общий токен бота: гоняем на одной ноге, иначе десять
       # параллельных прогонов упираются в лимиты реального API.
@@ -84,7 +88,7 @@ jobs:
           TEST_CHAT_ID: ${{ secrets.TEST_CHAT_ID }}
         run: |
           if [ -n "$MAX_BOT_TOKEN" ]; then
-            uv run pytest tests/ -v -m integration
+            uv run --no-sync pytest tests/ -v -m integration
           else
             echo "MAX_BOT_TOKEN не установлен, пропускаем интеграционные тесты"
           fi

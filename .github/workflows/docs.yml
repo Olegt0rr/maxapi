@@ -12,7 +12,7 @@ on:
       - 'uv.lock'
       - '.github/workflows/docs.yml'
   pull_request:
-    branches: [main, develop]
+    branches: [main]
     paths:
       - 'docs/**'
       - 'mkdocs.yml'
@@ -38,9 +38,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    permissions:
-      contents: read
-      pages: read  # configure-pages читает настройки Pages
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -55,12 +52,6 @@ jobs:
       - name: Install dependencies
         run: |
           uv sync --group dev --locked
-
-      - name: Setup Pages
-        if: >-
-          ${{ github.event_name != 'pull_request'
-          && github.ref == 'refs/heads/main' }}
-        uses: actions/configure-pages@v4
 
       # --strict: любое предупреждение mkdocs (битая ссылка, потерянный
       # файл) валит сборку, в том числе на pull_request.
