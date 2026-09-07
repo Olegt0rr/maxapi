@@ -237,8 +237,11 @@ jobs:
         run: |
           TAG="v$VERSION"
 
+          # Release уже есть (повторный запуск после сбоя): дозаливаем
+          # ассеты, --clobber делает шаг идемпотентным.
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG already exists, skipping."
+            echo "Release $TAG already exists, re-uploading assets."
+            gh release upload "$TAG" dist/* --clobber
             exit 0
           fi
 
