@@ -3,16 +3,25 @@ name = "maxapi"
 version = "1.2.2"
 description = "Библиотека для разработки чат-ботов с помощью API мессенджера MAX"
 readme = "README.md"
+license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [{ name = "Denis", email = "bestloveapples@gmail.com" }]
 keywords = ["max", "api", "bot"]
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Topic :: Communications :: Chat",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
 ]
 dependencies = [
     "aiohttp>=3.13,<4",
@@ -29,6 +38,10 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/love-apples/maxapi"
+Documentation = "https://love-apples.github.io/maxapi/"
+Repository = "https://github.com/love-apples/maxapi"
+Issues = "https://github.com/love-apples/maxapi/issues"
+Changelog = "https://github.com/love-apples/maxapi/releases"
 
 [build-system]
 requires = ["uv_build>=0.12.0,<0.13.0"]
