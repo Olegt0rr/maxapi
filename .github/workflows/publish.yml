@@ -29,12 +29,12 @@ jobs:
         && steps.pypi.outputs.published == 'false' }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v10
         with:
           version: "latest"
           enable-cache: false
@@ -176,7 +176,7 @@ jobs:
       # Пакет не пересобираем: на PyPI уходит ровно тот dist, который
       # гейт `package` проверил twine и check-wheel-contents.
       - name: Download dist artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
@@ -186,14 +186,19 @@ jobs:
       # используем (zizmor cache-poisoning): восстановленный из кеша
       # артефакт рядом с необратимой публикацией — лишний риск.
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v10
         with:
           version: "latest"
           enable-cache: false
 
       - name: Print dist hashes
         run: |
-          sha256sum dist/*
+          {
+            echo "### Публикуемые файлы"
+            echo '```'
+            sha256sum dist/*
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       # `--check-url` даёт идемпотентность: если тег или release упали
       # после загрузки, повторный запуск сверит хеши с PyPI и пропустит
