@@ -219,8 +219,18 @@ jobs:
           TAG="v$VERSION"
 
           # 404 — тега нет, создаём; любая другая ошибка API — падаем.
+          # Существующий тег обязан указывать на публикуемый коммит:
+          # иначе release получит исходники не того кода, что ушёл на PyPI.
           if out=$(gh api "repos/$GH_REPO/git/ref/tags/$TAG" 2>&1); then
-            echo "Tag $TAG already exists, skipping."
+            sha=$(jq -r '.object.sha' <<<"$out")
+            if [ "$(jq -r '.object.type' <<<"$out")" = "tag" ]; then
+              sha=$(gh api "repos/$GH_REPO/git/tags/$sha" --jq '.object.sha')
+            fi
+            if [ "$sha" != "$GITHUB_SHA" ]; then
+              echo "Tag $TAG points to $sha, expected $GITHUB_SHA" >&2
+              exit 1
+            fi
+            echo "Tag $TAG already exists at $GITHUB_SHA, skipping."
             exit 0
           elif ! grep -q "HTTP 404" <<<"$out"; then
             echo "$out" >&2
