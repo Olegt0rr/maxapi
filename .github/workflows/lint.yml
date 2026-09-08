@@ -38,7 +38,7 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v10.0.1
         with:
-          version: "latest"
+          version: "latest-known"
 
       # Группа ci: actionlint и zizmor зафиксированы в uv.lock,
       # обновляются через Dependabot, а не «что сегодня в PyPI».

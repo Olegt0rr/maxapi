@@ -91,6 +91,10 @@ Async Python SDK + bot-фреймворк для мессенджера **MAX** 
   `check-wheel-contents`), `actionlint` и `zizmor` по workflow; инструменты — группа `ci`.
   Обе цели запускают `uv run --locked`: рассинхрон `uv.lock` с `pyproject.toml` валит их,
   как и CI. Онлайн-аудиты zizmor берут токен из `gh auth token`, если `gh` авторизован.
+- Релиз: `uv version --bump patch|minor|major` меняет версию в `pyproject.toml` и `uv.lock`
+  вместе (ручной bump без `uv lock` уронит гейты на `--locked`). После мержа в `main`
+  `publish.yml` спрашивает PyPI, есть ли такая версия, и если нет — прогоняет гейты,
+  публикует через `uv publish`, создаёт тег и GitHub Release. Повторный запуск идемпотентен.
 - Тесты: `pytest -q [tests/test_X.py]`. `asyncio_mode = "auto"` — async-тесты не нуждаются в
   декораторах. Маркер `@pytest.mark.integration` автоматически пропускается без `MAX_BOT_TOKEN` в
   env (см. `tests/conftest.py::pytest_collection_modifyitems`). Фикстуры событий —

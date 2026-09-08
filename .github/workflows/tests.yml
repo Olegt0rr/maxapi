@@ -42,22 +42,22 @@ jobs:
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
         dependency-resolution: ["lowest-direct", "highest"]
-    env:
-      # Версия из матрицы задаётся uv напрямую: UV_PYTHON перебивает
-      # закоммиченный .python-version (3.10), из-за которого раньше все
-      # ноги матрицы фактически выполнялись на 3.10.
-      UV_PYTHON: ${{ matrix.python-version }}
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
           persist-credentials: false
 
+      # python-version выставляет UV_PYTHON и перебивает закоммиченный
+      # .python-version (3.10), из-за которого раньше все ноги матрицы
+      # фактически выполнялись на 3.10. cache-suffix разводит ключи
+      # кеша по резолюции, иначе все ячейки делят один ключ.
       - name: Install uv
         uses: astral-sh/setup-uv@v10.0.1
         with:
-          version: "latest"
+          version: "latest-known"
+          python-version: ${{ matrix.python-version }}
+          cache-suffix: ${{ matrix.dependency-resolution }}
 
       - name: Install dependencies with ${{ matrix.dependency-resolution }} resolution
         env:
@@ -106,6 +106,7 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage.xml
+          disable_search: true
           fail_ci_if_error: false
           flags: unittests
           name: codecov-umbrella

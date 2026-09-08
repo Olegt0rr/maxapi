@@ -47,7 +47,7 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v10.0.1
         with:
-          version: "latest"
+          version: "latest-known"
 
       - name: Install dependencies
         run: |
@@ -80,8 +80,8 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
-      pages: write
-      id-token: write
+      pages: write    # Публикация артефакта в Pages
+      id-token: write  # OIDC-токен для deploy-pages
     needs: build
     steps:
       - name: Deploy to GitHub Pages
