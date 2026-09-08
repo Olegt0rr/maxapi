@@ -20,6 +20,8 @@
   <img src='https://github.com/love-apples/maxapi/actions/workflows/tests.yml/badge.svg' alt='Tests'></a>
 <a href='https://github.com/love-apples/maxapi/actions/workflows/lint.yml'>
   <img src='https://github.com/love-apples/maxapi/actions/workflows/lint.yml/badge.svg' alt='Lint'></a>
+<a href='https://github.com/love-apples/maxapi/actions/workflows/mypy.yml'>
+  <img src='https://github.com/love-apples/maxapi/actions/workflows/mypy.yml/badge.svg' alt='Mypy'></a>
 <a href='https://github.com/love-apples/maxapi/actions/workflows/package.yml'>
   <img src='https://github.com/love-apples/maxapi/actions/workflows/package.yml/badge.svg' alt='Package'></a>
 <a href='https://github.com/love-apples/maxapi/actions/workflows/codeql.yml'>
@@ -59,16 +61,6 @@ pip install maxapi
 ```bash
 uv add maxapi
 ```
-
-## Разработка и релиз
-
-- Окружение: `uv sync`. Перед PR: `make run-test` (ruff, mypy, pytest) и `make check-ci`
-  (сборка пакета, actionlint, zizmor). Подробности и соглашения — в [AGENTS.md](AGENTS.md).
-- После правки зависимостей в `pyproject.toml` обновите lock: `uv lock`. CI ставит
-  инструменты с `--locked` и упадёт на рассинхроне.
-- Релиз: `uv version --bump patch` (или `minor`/`major`) обновляет версию в `pyproject.toml`
-  и `uv.lock` вместе; после мержа в `main` публикация на PyPI, тег и GitHub Release
-  создаются автоматически, если такой версии на PyPI ещё нет.
 
 ## Установка из GitHub
 
@@ -247,3 +239,15 @@ async def main():
 
 asyncio.run(main())
 ```
+
+## Разработка и релиз
+
+- Окружение: `uv sync`. Перед PR: `make run-test` (ruff, mypy, pytest) и `make check-ci`
+  (сборка пакета, actionlint, zizmor). Подробности и соглашения — в [AGENTS.md](AGENTS.md).
+- После правки зависимостей в `pyproject.toml` обновите lock: `uv lock`. CI ставит
+  инструменты с `--locked` и упадёт на рассинхроне.
+- Релиз: `uv version --bump patch` (или `minor`/`major`) обновляет версию в `pyproject.toml`
+  и `uv.lock` вместе; после мержа в `main` публикация на PyPI, тег и GitHub Release
+  создаются автоматически, если такой версии на PyPI ещё нет. Если шаг после загрузки
+  на PyPI упал, помогает «Re-run failed jobs» того же run: шаги тега и release
+  идемпотентны. Свежий запуск увидит версию на PyPI и ничего не сделает.

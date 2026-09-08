@@ -80,7 +80,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
-      pages: write    # Публикация артефакта в Pages
+      pages: write     # Публикация артефакта в Pages
       id-token: write  # OIDC-токен для deploy-pages
     needs: build
     steps:

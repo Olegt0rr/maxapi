@@ -94,7 +94,9 @@ Async Python SDK + bot-фреймворк для мессенджера **MAX** 
 - Релиз: `uv version --bump patch|minor|major` меняет версию в `pyproject.toml` и `uv.lock`
   вместе (ручной bump без `uv lock` уронит гейты на `--locked`). После мержа в `main`
   `publish.yml` спрашивает PyPI, есть ли такая версия, и если нет — прогоняет гейты,
-  публикует через `uv publish`, создаёт тег и GitHub Release. Повторный запуск идемпотентен.
+  публикует через `uv publish`, создаёт тег и GitHub Release. Если шаг после загрузки на
+  PyPI упал, чинит «Re-run failed jobs» (шаги тега и release идемпотентны); свежий запуск
+  увидит версию на PyPI и корректно ничего не сделает.
 - Тесты: `pytest -q [tests/test_X.py]`. `asyncio_mode = "auto"` — async-тесты не нуждаются в
   декораторах. Маркер `@pytest.mark.integration` автоматически пропускается без `MAX_BOT_TOKEN` в
   env (см. `tests/conftest.py::pytest_collection_modifyitems`). Фикстуры событий —

@@ -61,7 +61,7 @@ jobs:
       # bump версии может приехать не последним коммитом в push,
       # а workflow_dispatch остаётся идемпотентным. Эндпоинт
       # /pypi/{name}/{version}/json сам сопоставляет версии по
-      # PEP 440 (1.2.2 == 1.2.2.0, 1.2.2-1 == 1.2.2.post1 — setuptools
+      # PEP 440 (1.2.2 == 1.2.2.0, 1.2.2-1 == 1.2.2.post1 — бэкенд
       # нормализует версию при сборке) и не тянет весь блоб релизов.
       - name: Check if version is published on PyPI
         id: pypi

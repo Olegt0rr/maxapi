@@ -9,7 +9,6 @@ requires-python = ">=3.10"
 authors = [{ name = "Denis", email = "bestloveapples@gmail.com" }]
 keywords = ["max", "api", "bot"]
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
     "Framework :: AsyncIO",
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
