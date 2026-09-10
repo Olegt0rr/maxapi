@@ -3,43 +3,55 @@ name = "maxapi"
 version = "1.2.2"
 description = "Библиотека для разработки чат-ботов с помощью API мессенджера MAX"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [{ name = "Denis", email = "bestloveapples@gmail.com" }]
 keywords = ["max", "api", "bot"]
 classifiers = [
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Topic :: Communications :: Chat",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
 ]
 dependencies = [
     "aiohttp>=3.13,<4",
-    "backoff>=2.0,<3",
-    "magic_filter>=1.0.0,<2",
-    "pydantic>=2,<3",
+    # Нижние границы проверяются ногой lowest-direct в CI:
+    # backoff 2.2 — details["exception"] в on_backoff; magic_filter 1.0.4 —
+    # MagicT; pydantic 2.12 — сериализация computed-поля url поверх alias
+    # (и первые wheel-ы pydantic-core под Python 3.14).
+    "backoff>=2.2,<3",
+    "magic_filter>=1.0.4,<2",
+    "pydantic>=2.12,<3",
     "aiofiles>=24.1,<26",
     "puremagic>=1.30,<2",
 ]
 
 [project.urls]
 Homepage = "https://github.com/love-apples/maxapi"
-
-[tool.setuptools]
-license-files = []
-
-[tool.setuptools.package-data]
-maxapi = ["py.typed", "client/russiantrustedca.pem"]
+Documentation = "https://love-apples.github.io/maxapi/"
+Repository = "https://github.com/love-apples/maxapi"
+Issues = "https://github.com/love-apples/maxapi/issues"
+Changelog = "https://github.com/love-apples/maxapi/releases"
 
 [build-system]
-requires = [
-    "setuptools>=82.0.0",
-    "wheel>=0.46.3",
-]
-build-backend = "setuptools.build_meta"
+requires = ["uv_build>=0.12.0,<0.13.0"]
+build-backend = "uv_build"
 
-[tool.setuptools.packages.find]
-include = ["maxapi*", "wiki*", "examples*"]
+[tool.uv.build-backend]
+# Flat layout: пакет maxapi/ лежит в корне, а не в src/.
+module-root = ""
+# В wheel уходит только maxapi/; в sdist дополнительно тесты и примеры.
+source-include = ["tests/**", "examples/**"]
 
 [project.optional-dependencies]
 fastapi = [
@@ -47,7 +59,9 @@ fastapi = [
     "uvicorn>=0.15.0,<1",
 ]
 litestar = [
-    "litestar>=2.0.0,<3",
+    # litestar < 2.3 несовместим с logging.config Python 3.12+.
+    "litestar>=2.0.0,<3; python_version < '3.12'",
+    "litestar>=2.3.0,<3; python_version >= '3.12'",
     "uvicorn>=0.15.0,<1",
 ]
 # алиас для обратной совместимости с maxapi[webhook]
@@ -70,8 +84,18 @@ dev = [
     "pymdown-extensions>=10.21",
     "python-dotenv>=1.2.1",
     "Faker>=40.4.0",
-    "httpx>=0.28.1,<1",
+    # httpx 0.28 убрал app= в Client: TestClient старых fastapi/litestar
+    # (нижние границы extras) с ним не работает.
+    "httpx>=0.27,<1",
     "aresponses>=3.0.0,<4",
+]
+
+# Инструменты CI: зафиксированы в uv.lock, обновляются через Dependabot.
+ci = [
+    "actionlint-py>=1.7",
+    "zizmor>=1.0",
+    "twine>=6.0",
+    "check-wheel-contents>=0.6",
 ]
 
 [tool.uv]
@@ -83,7 +107,6 @@ managed = true
 python_version = "3.10"
 namespace_packages = true
 ignore_missing_imports = true
-exclude = ["core/yandex/cloud", "core/google"]
 check_untyped_defs = true
 
 [tool.pytest.ini_options]
@@ -110,9 +133,12 @@ filterwarnings = [
 ]
 
 
+[tool.coverage.report]
+# Порог покрытия unit-тестами.
+fail_under = 90
+
 [tool.ruff]
 src = ["maxapi", "tests"]
-exclude = ["core/yandex/cloud", "core/google"]
 line-length = 79
 indent-width = 4
 target-version = "py310"

@@ -76,13 +76,27 @@ Async Python SDK + bot-фреймворк для мессенджера **MAX** 
 
 ## Workflows
 
-- Окружение: `uv sync --all-groups` → `source .venv/bin/activate`. Python ≥ 3.10, target — 3.10.
-  Менеджер — **uv**, не pip/poetry.
+- Окружение: `uv sync` (группа `dev` ставится по умолчанию) → `source .venv/bin/activate`.
+  Python ≥ 3.10, target — 3.10.
+  Менеджер — **uv**, не pip/poetry. `uv.lock` коммитится и фиксирует dev-инструменты: lint,
+  mypy и docs в CI ставятся с `--locked`, поэтому после правки `pyproject.toml` обновляйте
+  lock (`uv lock`). Тесты в CI резолвят зависимости заново (`lowest-direct` и `highest`
+  с `--upgrade`), чтобы ловить поломки от новых релизов зависимостей, как у пользователей.
 - **Git — всегда с `--no-pager`** или через перенаправление (`| cat`), чтобы пагинатор не
   подвешивал выполнение: `git --no-pager log`, `git --no-pager diff`, `git --no-pager branch`, и
   т.д.
 - Полная проверка перед PR: `make run-test` — параллельно запускает `ruff check .`,
   `ruff format . --check`, `mypy maxapi`, `pytest -q`. Форматирование — `make format`.
+  `make check-ci` — остальное, что проверяет CI: сборка пакета (`twine check`,
+  `check-wheel-contents`), `actionlint` и `zizmor` по workflow; инструменты — группа `ci`.
+  Обе цели запускают `uv run --locked`: рассинхрон `uv.lock` с `pyproject.toml` валит их,
+  как и CI. Онлайн-аудиты zizmor берут токен из `gh auth token`, если `gh` авторизован.
+- Релиз: `uv version --bump patch|minor|major` меняет версию в `pyproject.toml` и `uv.lock`
+  вместе (ручной bump без `uv lock` уронит гейты на `--locked`). После мержа в `main`
+  `publish.yml` спрашивает PyPI, есть ли такая версия, и если нет — прогоняет гейты,
+  публикует через `uv publish`, создаёт тег и GitHub Release. Если шаг после загрузки на
+  PyPI упал, чинит «Re-run failed jobs» (шаги тега и release идемпотентны); свежий запуск
+  увидит версию на PyPI и корректно ничего не сделает.
 - Тесты: `pytest -q [tests/test_X.py]`. `asyncio_mode = "auto"` — async-тесты не нуждаются в
   декораторах. Маркер `@pytest.mark.integration` автоматически пропускается без `MAX_BOT_TOKEN` в
   env (см. `tests/conftest.py::pytest_collection_modifyitems`). Фикстуры событий —
