@@ -760,20 +760,34 @@ class TestHandlePipeline:
 
         _setup_for_handle(dispatcher, bot)
         dispatcher._ready = True
-        # _prepare_handlers уже заполнил кеш; сбрасываем, чтобы
-        # покрыть ветку «кеш пуст → строится через _build_dispatch_entries()»
-        dispatcher._cached_router_entries = None
 
-        # Первый вызов строит и сохраняет список записей в кеш.
-        await dispatcher.handle(fixture_message_created)
+        # Кеш заполнен подготовкой обработчиков, а не первым событием.
         cached = dispatcher._cached_router_entries
         assert cached is not None
 
-        # Повторный вызов использует уже заполненный _cached_router_entries.
+        # Оба вызова используют один и тот же список записей.
+        await dispatcher.handle(fixture_message_created)
+        assert dispatcher._cached_router_entries is cached
         await dispatcher.handle(fixture_message_created)
         assert dispatcher._cached_router_entries is cached
 
         assert len(handled) == 2
+
+        # Поздняя регистрация — единственный повод пересобрать кеш.
+        @dispatcher.bot_started()
+        async def _late(event):
+            pass
+
+        await dispatcher.handle(fixture_message_created)
+        rebuilt = dispatcher._cached_router_entries
+        assert rebuilt is not None
+        assert rebuilt is not cached
+        assert len(handled) == 3
+
+        # Пересобранный кеш дальше тоже переиспользуется.
+        await dispatcher.handle(fixture_message_created)
+        assert dispatcher._cached_router_entries is rebuilt
+        assert len(handled) == 4
 
     async def test_iter_dispatch_entries_is_lazy(self, dispatcher, bot):
         """_iter_dispatch_entries() возвращает ленивый генератор,
@@ -785,13 +799,17 @@ class TestHandlePipeline:
         gen = dispatcher._iter_dispatch_entries()
         assert isinstance(gen, types.GeneratorType)
 
-        # Генератор выдаёт кортежи (router, outer_mw, filters, base_filters)
+        # Генератор выдаёт кортежи
+        # (router, outer_mw, filters, base_filters, handlers_index)
         entries = list(gen)
         assert len(entries) >= 1
-        _router, outer_mw, filters, base_filters = entries[0]
+        _router, outer_mw, filters, base_filters, index = entries[0]
         assert isinstance(outer_mw, list)
         assert isinstance(filters, list)
         assert isinstance(base_filters, list)
+        # На ленивом пути снимок индекса не передаётся: чужой индекс
+        # читать нельзя, обработчики ищутся линейным сканом.
+        assert index is None
 
     async def test_not_ready_does_not_cache_entries(
         self, dispatcher, bot, fixture_message_created
@@ -1114,7 +1132,7 @@ class TestDispatcherHelpers:
             dp_module.CONTEXTS_MAX_SIZE = original
 
     def test_find_matching_handlers_without_index(self, dispatcher):
-        """Fallback на линейный поиск когда handlers_by_type не построен."""
+        """Fallback на линейный поиск, когда снимок индекса не передан."""
         router = Router(router_id="r1")
 
         @router.message_created()
@@ -1124,9 +1142,26 @@ class TestDispatcherHelpers:
         router.handlers_by_type = None  # индекс не построен
 
         result = dispatcher._find_matching_handlers(
-            router, UpdateType.MESSAGE_CREATED
+            router, UpdateType.MESSAGE_CREATED, None
         )
         assert len(result) == 1
+
+    def test_find_matching_handlers_uses_snapshot(self, dispatcher):
+        """Используется переданный снимок, а не живой индекс роутера."""
+        router = Router(router_id="r1")
+
+        @router.message_created()
+        async def _handler(event: MessageCreated):
+            logger.debug("Получено событие: %s", event)
+
+        snapshot = {UpdateType.MESSAGE_CREATED: list(router.event_handlers)}
+        # Роутер уже переиндексирован: живой индекс пуст.
+        router.handlers_by_type = {}
+
+        result = dispatcher._find_matching_handlers(
+            router, UpdateType.MESSAGE_CREATED, snapshot
+        )
+        assert result == snapshot[UpdateType.MESSAGE_CREATED]
 
     async def test_check_handler_match_state_mismatch(
         self, dispatcher, fixture_message_created

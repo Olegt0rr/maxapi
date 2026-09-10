@@ -4,14 +4,18 @@ import asyncio
 import functools
 import inspect
 import warnings
+import weakref
 from asyncio.exceptions import TimeoutError as AsyncioTimeoutError
 from collections import OrderedDict
 from collections.abc import Hashable
+from contextlib import suppress
+from contextvars import ContextVar
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, cast
 from warnings import warn
 
 from aiohttp import ClientConnectorError
+from magic_filter import MagicFilter
 
 from .context import BaseContext, ContextManager, MemoryContext
 from .context.isolation import BaseEventIsolation, DisabledEventIsolation
@@ -32,8 +36,6 @@ from .webhook.aiohttp import AiohttpMaxWebhook
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator
 
-    from magic_filter import MagicFilter
-
     from .bot import Bot
     from .filters.filter import BaseFilter
     from .filters.middleware import BaseMiddleware, HandlerCallable
@@ -44,6 +46,38 @@ GET_UPDATES_RETRY_DELAY = 5
 CONTEXTS_MAX_SIZE = 10_000
 
 _FilterKwargSpec = tuple[str | None, frozenset[str] | None]
+
+_DispatchEntry = tuple[
+    "Router | Dispatcher",
+    "list[BaseMiddleware]",
+    "list[MagicFilter]",
+    "list[BaseFilter]",
+    "dict[UpdateType, list[Handler]] | None",
+]
+"""Запись дерева роутеров для диспетчеризации.
+
+``(роутер, outer-middleware, MagicFilter, BaseFilter, снимок индекса)``.
+Последний элемент — ``router.handlers_by_type`` на момент построения
+записи либо ``None`` для ленивого пути (см.
+:meth:`Dispatcher._iter_dispatch_entries`).
+"""
+
+_in_handler: ContextVar[tuple[Dispatcher, asyncio.Task] | None] = ContextVar(
+    "maxapi_in_handler", default=None
+)
+"""Маркер выполнения :meth:`Dispatcher.handle`: ``(диспетчер, задача)``.
+
+Нужен :meth:`Dispatcher.shutdown`, чтобы распознать реентрантный вызов
+(обработчик остановил диспетчер сам) и не дожидаться задач, которые ждут
+этот же обработчик.
+
+Метка наследуется в ``create_task`` и общая для всех диспетчеров
+процесса, поэтому в неё записан не факт «мы в обработчике», а его
+владелец и задача: реентрантен только вызов из ТОЙ ЖЕ задачи и для ТОГО
+ЖЕ диспетчера. Дочерняя задача обработчика метку унаследует, но её
+``current_task()`` другой — для неё ``shutdown`` дренирует пул как
+обычно.
+"""
 
 
 @functools.lru_cache(maxsize=1024)
@@ -147,21 +181,25 @@ class Dispatcher(BotMixin):
         self.on_started_func: Callable | None = None
         self.polling = False
         self.use_create_task = use_create_task
-        self._cached_router_entries: (
-            list[
-                tuple[
-                    Router | Dispatcher,
-                    list[BaseMiddleware],
-                    list[MagicFilter],
-                    list[BaseFilter],
-                ]
-            ]
-            | None
-        ) = None
+        self._cached_router_entries: list[_DispatchEntry] | None = None
         self._global_mw_chain: HandlerCallable | None = None
         self._background_tasks: set[asyncio.Task] = set()
         self._closing: bool = False
+        self._deferred_shutdown: bool = False
+        self._polling_task: asyncio.Task | None = None
+        self._polling_active: bool = False
+        self._lifecycle_holders: int = 0
+        self._cleanup_done: asyncio.Event | None = None
+        self._loop_done: asyncio.Event | None = None
+        self._polling_error: BaseException | None = None
+        self._stop_event: asyncio.Event | None = None
         self._ready: bool = False
+        self._running_on_started: bool = False
+        self._parents: weakref.WeakSet[Dispatcher] = weakref.WeakSet()
+        self._handlers_dirty: bool = False
+        self._warned_duplicate_routers: weakref.WeakSet[
+            Router | Dispatcher
+        ] = weakref.WeakSet()
 
         self.message_created = Event(
             update_type=UpdateType.MESSAGE_CREATED, router=self
@@ -255,6 +293,7 @@ class Dispatcher(BotMixin):
             stacklevel=2,
         )
         self.outer_middlewares = value
+        self._invalidate_handlers()
 
     async def check_me(self) -> None:
         """
@@ -298,11 +337,112 @@ class Dispatcher(BotMixin):
         """
         Добавляет указанные роутеры в диспетчер.
 
+        Можно вызывать и после старта: индекс обработчиков будет
+        перестроен перед следующей диспетчеризацией, тогда же у
+        добавленного роутера появится ``router.bot`` (до этого он
+        остаётся ``None``).
+
+        Порядок обхода сохраняется: включённые роутеры проверяются
+        раньше собственных обработчиков диспетчера — в том числе при
+        позднем включении, когда сам диспетчер уже добавлен в конец
+        ``self.routers`` (см. :meth:`__ready`).
+
+        Прямая мутация ``dp.routers`` (``dp.routers.append(...)``)
+        индекс устаревшим не помечает: изменения попадут в
+        диспетчеризацию лишь при следующей перестройке, вызванной
+        другой регистрацией, а добавленный так роутер окажется после
+        собственных обработчиков диспетчера. Используйте этот метод.
+
+        Роутер должен принадлежать ОДНОМУ дереву — одному диспетчеру.
+        Включение одного и того же роутера в несколько диспетчеров не
+        поддерживается: подготовленное состояние (``router.bot``,
+        выпеченные цепочки middleware в ``handler.mw_chain``) хранится
+        на самих объектах роутера и обработчиков, и подготовка второго
+        диспетчера перезапишет его для первого — как и ``bot.commands``
+        с ``bot.dispatcher``, которые тоже одни. Внутри одного дерева
+        повторное включение допустимо: обход дедуплицирует роутеры по
+        первому вхождению (и предупреждает о дублях).
+
         Args:
             *routers: Роутеры для добавления.
         """
 
-        self.routers.extend(routers)
+        if self in self.routers:
+            # Сам диспетчер стоит последним: новые роутеры должны
+            # попасть перед ним, иначе поздно включённый роутер
+            # получал бы событие после хендлеров самого dp.
+            position = self.routers.index(self)
+            self.routers[position:position] = routers
+        else:
+            self.routers.extend(routers)
+
+        for router in routers:
+            router._parents.add(self)  # noqa: SLF001
+
+        self._invalidate_handlers()
+
+    def _invalidate_handlers(self, _seen: set[int] | None = None) -> None:
+        """
+        Помечает индекс обработчиков устаревшим и уведомляет родителей.
+
+        Вызывается при регистрации через публичные методы: хендлера,
+        роутера, middleware или фильтра. Прямые мутации списков
+        (``routers``, ``filters``, ``outer_middlewares`` и т.п.) сюда не
+        попадают и индексом не отслеживаются. Сам индекс
+        перестраивается лениво, перед следующей диспетчеризацией
+        (см. :meth:`_ensure_prepared`).
+
+        ``handlers_by_type`` при этом НЕ сбрасывается: уже начатая
+        диспетчеризация обязана доработать на том индексе, с которым
+        стартовала. Иначе она провалилась бы на линейный скан
+        ``event_handlers`` и выполнила бы только что зарегистрированный
+        обработчик с ``mw_chain=None``, минуя inner-middleware. Новый
+        индекс публикуется целиком в :meth:`_prepare_handlers`, а
+        ленивый путь чужой индекс не читает вовсе
+        (см. :meth:`_iter_dispatch_entries`).
+
+        Args:
+            _seen: Идентификаторы уже посещённых роутеров. Защищает от
+                зацикливания при взаимных включениях. Ранний выход по
+                самому флагу ``_handlers_dirty`` не годится: у детей он
+                никогда не сбрасывается, и следующая инвалидация не
+                дошла бы до корня.
+        """
+
+        seen = set() if _seen is None else _seen
+        if id(self) in seen:
+            return
+        seen.add(id(self))
+
+        self._handlers_dirty = True
+        self._cached_router_entries = None
+
+        for parent in self._parents:
+            parent._invalidate_handlers(seen)  # noqa: SLF001
+
+    def _ensure_prepared(self) -> None:
+        """
+        Перестраивает индекс обработчиков, если были поздние регистрации.
+
+        Условие перестройки не зависит от ``_ready``: после
+        :meth:`stop_polling` диспетчер уже не «готов», но индекс с
+        прошлого запуска остаётся и должен учитывать новые регистрации.
+        Единственное требование — известный ``bot``: до первого старта
+        перестраивать нечем, и диспетчеризация идёт по ленивому пути.
+
+        Метод синхронный: между проверкой флага и перестройкой нет точек
+        переключения event loop, поэтому диспетчеризация никогда не
+        видит полуготовый индекс.
+        """
+
+        bot = self.bot
+        if not self._handlers_dirty or bot is None:
+            return
+
+        self._prepare_handlers(bot, rebuild=True)
+        self._global_mw_chain = self.build_middleware_chain(
+            self.outer_middlewares, self._process_event
+        )
 
     def register_outer_middleware(self, middleware: BaseMiddleware) -> None:
         """
@@ -319,6 +459,7 @@ class Dispatcher(BotMixin):
             middleware: Middleware.
         """
         self.outer_middlewares.append(middleware)
+        self._invalidate_handlers()
 
     def register_inner_middleware(self, middleware: BaseMiddleware) -> None:
         """
@@ -329,10 +470,16 @@ class Dispatcher(BotMixin):
         Dispatcher — только для событий, попавших хоть в один handler;
         на уровне Router — только для handler этого роутера.
 
+        Регистрация во время обработки события применяется и к нему,
+        если вызов его обработчика ещё не начался: перестройка индекса
+        переприсваивает ``handler.mw_chain``
+        (см. :meth:`_prepare_handlers`).
+
         Args:
             middleware (BaseMiddleware): Middleware.
         """
         self.inner_middlewares.append(middleware)
+        self._invalidate_handlers()
 
     def outer_middleware(self, middleware: BaseMiddleware) -> None:
         """
@@ -356,6 +503,7 @@ class Dispatcher(BotMixin):
             stacklevel=2,
         )
         self.outer_middlewares.insert(0, middleware)
+        self._invalidate_handlers()
 
     def middleware(self, middleware: BaseMiddleware) -> None:
         """
@@ -379,53 +527,127 @@ class Dispatcher(BotMixin):
             stacklevel=2,
         )
         self.outer_middlewares.append(middleware)
+        self._invalidate_handlers()
 
-    def filter(self, base_filter: BaseFilter) -> None:
+    def filter(self, base_filter: MagicFilter | BaseFilter) -> None:
         """
-        Добавляет фильтр в список.
+        Добавляет фильтр уровня роутера.
+
+        Принимает как :class:`~magic_filter.MagicFilter`
+        (``F.chat.type == ChatType.DIALOG``), так и
+        :class:`~maxapi.filters.filter.BaseFilter`: тип определяется по
+        значению и фильтр попадает в ``filters`` или ``base_filters``
+        соответственно.
+
+        Можно вызывать и после старта. Прямая мутация списков
+        (``router.filters.append(...)``) индекс устаревшим не
+        помечает: добавленный так фильтр начнёт действовать лишь
+        после перестройки, вызванной другой регистрацией. Используйте
+        этот метод.
 
         Args:
             base_filter: Фильтр.
         """
 
-        self.base_filters.append(base_filter)
+        if isinstance(base_filter, MagicFilter):
+            self.filters.append(base_filter)
+        else:
+            self.base_filters.append(base_filter)
+
+        self._invalidate_handlers()
 
     async def __ready(self, bot: Bot) -> None:
         """
         Подготавливает диспетчер: сохраняет бота, подготавливает
         обработчики, вызывает on_started.
 
+        Флаг ``_running_on_started`` взводится ровно на фазу вызова
+        ``on_started`` — непосредственно перед чтением
+        ``on_started_func``. По нему :meth:`Event.register` отличает
+        регистрацию колбэка изнутри самого ``on_started`` (в этом
+        запуске он уже не будет вызван) от регистрации в окне
+        подготовки до этой фазы (``check_me`` и проверка подписок):
+        колбэк, зарегистрированный там, штатно сработает в этом же
+        запуске, и предупреждать о нём не о чем.
+
         Args:
             bot: Экземпляр бота.
         """
 
+        # Сбрасываем признак завершения до раннего выхода: повторный
+        # startup() после shutdown() (webhook-сценарий) не проходит
+        # подготовку заново, но диспетчер снова принимает события.
+        self._closing = False
+
         if self._ready:
+            # Регистрации между shutdown() и повторным startup()
+            # должны попасть в индекс сразу: подготовка не
+            # повторяется, а bot.commands обязан быть актуален уже
+            # до первого события.
+            self._ensure_prepared()
             return
 
-        self._closing = False
         self.bot = bot
         self.bot.dispatcher = self
+
+        # Сам диспетчер добавляем в роутеры до сетевых await'ов
+        # ниже: событие, пришедшее в окно подготовки, вызовет
+        # перестройку индекса, и без этого его собственные
+        # обработчики в неё не попадут.
+        if self not in self.routers:
+            self.routers.append(self)
 
         if self.polling and bot.auto_check_subscriptions:
             await self._check_subscriptions(bot)
 
         await self.check_me()
 
-        if self not in self.routers:
-            self.routers.append(self)
         self._prepare_handlers(bot)
 
         self._global_mw_chain = self.build_middleware_chain(
             self.outer_middlewares, self._process_event
         )
 
-        if self.on_started_func:
-            await self.on_started_func()
+        # Флаг взводим до чтения on_started_func: всё, что
+        # зарегистрировано позже этой точки, в текущем запуске уже не
+        # вызовется.
+        self._running_on_started = True
+        try:
+            if self.on_started_func:
+                await self.on_started_func()
+        finally:
+            self._running_on_started = False
+
+        # Регистрации внутри on_started попадают в индекс сразу,
+        # чтобы первое же событие не платило за перестройку.
+        self._ensure_prepared()
 
         self._ready = True
 
-    def _prepare_handlers(self, bot: Bot) -> None:
-        """Подготовить обработчики событий и построить кеши."""
+    def _prepare_handlers(self, bot: Bot, *, rebuild: bool = False) -> None:
+        """Подготовить обработчики событий и построить кеши.
+
+        ``bot.commands`` целиком принадлежит диспетчеру и на каждой
+        подготовке производится заново из дерева обработчиков ЭТОГО
+        диспетчера, поэтому список очищается в начале: иначе повторный
+        ``startup()`` или перестройка индекса дублировали бы команды.
+        Один ``Bot`` на два диспетчера не поддерживается: подготовка
+        второго затрёт команды первого.
+
+        Цепочки ``handler.mw_chain`` перестройка переприсваивает, а не
+        версионирует: middleware, зарегистрированная во время обработки
+        события, применится и к нему, если вызов его обработчика ещё не
+        начался. Обходом это не является — цепочка в любом случае
+        полная; снимок цепочек по поколениям потребовал бы копировать
+        каждый ``Handler`` на каждую перестройку.
+
+        Args:
+            bot: Экземпляр бота.
+            rebuild: Признак повторной подготовки после поздних
+                регистраций. При нём итог логируется на уровне debug.
+        """
+
+        bot.commands.clear()
 
         handlers_count = 0
         global_inner_mw = self.inner_middlewares
@@ -434,7 +656,7 @@ class Dispatcher(BotMixin):
             self.routers, warn_duplicates=True
         ):
             router.bot = bot
-            router.handlers_by_type = {}
+            handlers_index: dict[UpdateType, list[Handler]] = {}
 
             for handler in router.event_handlers:
                 handlers_count += 1
@@ -453,9 +675,13 @@ class Dispatcher(BotMixin):
                     all_inner,
                     functools.partial(self.call_handler, handler),
                 )
-                router.handlers_by_type.setdefault(
-                    handler.update_type, []
-                ).append(handler)
+                handlers_index.setdefault(handler.update_type, []).append(
+                    handler
+                )
+
+            # Публикация одним присваиванием: диспетчеризации,
+            # начатые со старым индексом, продолжают видеть его.
+            router.handlers_by_type = handlers_index
 
             for error_handler in router.error_handlers:
                 error_handler.func_args = frozenset(
@@ -463,29 +689,31 @@ class Dispatcher(BotMixin):
                 )
 
         self._cached_router_entries = self._build_dispatch_entries()
+        self._handlers_dirty = False
 
-        logger_dp.info(
-            "Зарегистрировано %d обработчиков событий", handlers_count
-        )
+        if rebuild:
+            logger_dp.debug(
+                "Индекс перестроен: %d обработчиков событий", handlers_count
+            )
+        else:
+            logger_dp.info(
+                "Зарегистрировано %d обработчиков событий", handlers_count
+            )
 
-    def _iter_dispatch_entries(
-        self,
-    ) -> Iterator[
-        tuple[
-            Router | Dispatcher,
-            list[BaseMiddleware],
-            list[MagicFilter],
-            list[BaseFilter],
-        ]
-    ]:
+    def _iter_dispatch_entries(self) -> Iterator[_DispatchEntry]:
         """Ленивый генератор entries для dispatch.
 
-        Используется когда ``_ready=False`` — позволяет остановить обход
-        дерева роутеров сразу после первого совпадения, не аллоцируя
-        полный список.  Inner-middleware уже выпечены в
-        ``handler.mw_chain`` в :meth:`_prepare_handlers`, поэтому в
-        кортеж попадают только ``(router, outer_mw, filters,
-        base_filters)``.
+        Используется, когда кеша записей нет
+        (``_cached_router_entries is None``): до первой подготовки или
+        после инвалидации у диспетчера без ``bot``. Позволяет
+        остановить обход дерева роутеров сразу после первого
+        совпадения, не аллоцируя полный список. Inner-middleware на
+        этом пути могут быть ещё не выпечены в ``handler.mw_chain``
+        (это делает :meth:`_prepare_handlers`), поэтому снимок индекса
+        в записи всегда ``None``: подходящие обработчики ищутся
+        линейным сканом ``event_handlers``. Так неподготовленный
+        диспетчер не читает индекс роутера, построенный другим
+        диспетчером.
         """
         for (
             router,
@@ -494,25 +722,32 @@ class Dispatcher(BotMixin):
             filters,
             base_filters,
         ) in self._iter_unique_routers(self.routers):
-            yield router, outer_mw, filters, base_filters
+            yield router, outer_mw, filters, base_filters, None
 
-    def _build_dispatch_entries(
-        self,
-    ) -> list[
-        tuple[
-            Router | Dispatcher,
-            list[BaseMiddleware],
-            list[MagicFilter],
-            list[BaseFilter],
-        ]
-    ]:
+    def _build_dispatch_entries(self) -> list[_DispatchEntry]:
         """Материализует полный список entries для кеша горячего пути.
 
-        Вызывается один раз при ``_ready=True`` и результат сохраняется в
-        ``_cached_router_entries``. Для ``_ready=False`` используйте
+        Вызывается на каждой подготовке обработчиков
+        (:meth:`_prepare_handlers`); результат сохраняется в
+        ``_cached_router_entries`` и используется, пока индекс не
+        инвалидирован. Пока кеша нет, работает
         :meth:`_iter_dispatch_entries`.
+
+        В каждую запись кладётся снимок ``router.handlers_by_type`` —
+        просто ссылка на текущий dict. Диспетчеризация работает с ним
+        до самого конца, поэтому поздняя регистрация не подсунет ей
+        обработчик без выпеченной цепочки inner-middleware.
         """
-        return list(self._iter_dispatch_entries())
+        return [
+            (router, outer_mw, filters, base_filters, router.handlers_by_type)
+            for (
+                router,
+                outer_mw,
+                filters,
+                base_filters,
+                _index,
+            ) in self._iter_dispatch_entries()
+        ]
 
     @staticmethod
     async def _check_subscriptions(bot: Bot) -> None:
@@ -823,9 +1058,13 @@ class Dispatcher(BotMixin):
                 роутеров.
             warn_duplicates: Если True, выводит предупреждение при обнаружении
                 повторных включений одного и того же экземпляра роутера.
+                О каждом роутере предупреждаем только один раз за всю
+                жизнь диспетчера (``_warned_duplicate_routers``): иначе
+                каждая перестройка индекса повторяла бы старые
+                предупреждения, а дубли, появившиеся уже после старта,
+                наоборот, остались бы незамеченными.
         """
         seen: set[int] = set()
-        duplicate_keys: set[int] = set()
         duplicate_titles: list[str] = []
         try:
             for item in self._iter_routers(
@@ -838,8 +1077,11 @@ class Dispatcher(BotMixin):
                 router = item[0]
                 router_key = id(router)
                 if router_key in seen:
-                    if warn_duplicates and router_key not in duplicate_keys:
-                        duplicate_keys.add(router_key)
+                    if (
+                        warn_duplicates
+                        and router not in self._warned_duplicate_routers
+                    ):
+                        self._warned_duplicate_routers.add(router)
                         rid = getattr(router, "router_id", None)
                         router_title = (
                             str(rid)
@@ -889,21 +1131,29 @@ class Dispatcher(BotMixin):
 
     @staticmethod
     def _find_matching_handlers(
-        router: Router | Dispatcher, event_type: UpdateType
+        router: Router | Dispatcher,
+        event_type: UpdateType,
+        handlers_index: dict[UpdateType, list[Handler]] | None,
     ) -> list[Handler]:
         """
         Находит обработчики, соответствующие типу события в роутере.
 
+        Индекс приходит снимком из записи дерева роутеров, а не читается
+        из ``router.handlers_by_type``: за время диспетчеризации роутер
+        мог получить новый индекс, а начатая обработка обязана видеть
+        только тот, с которым стартовала.
+
         Args:
             router: Роутер для поиска.
             event_type: Тип события.
+            handlers_index: Снимок индекса роутера. При ``None``
+                (ленивый путь) выполняется линейный скан обработчиков.
 
         Returns:
             List[Handler]: Список подходящих обработчиков.
         """
-        index = router.handlers_by_type
-        if index is not None:
-            return index.get(event_type, [])
+        if handlers_index is not None:
+            return handlers_index.get(event_type, [])
 
         return [
             handler
@@ -1022,15 +1272,18 @@ class Dispatcher(BotMixin):
         если тело ответа не является JSON-объектом (например, HTML
         от прокси при 502/503).
         """
-        entries = (
+        self._ensure_prepared()
+
+        entries: Iterable[_DispatchEntry] = (
             self._cached_router_entries
             if self._cached_router_entries is not None
-            else self._iter_unique_routers(self.routers)
+            else self._iter_dispatch_entries()
         )
-        for router, *_ in entries:
+        for router, *_, handlers_index in entries:
             matching_handlers = self._find_matching_handlers(
                 router=router,
                 event_type=event_type,
+                handlers_index=handlers_index,
             )
             for handler in matching_handlers:
                 try:
@@ -1191,17 +1444,12 @@ class Dispatcher(BotMixin):
         """
         router_id = None
 
-        entries: Iterable[
-            tuple[
-                Router | Dispatcher,
-                list[BaseMiddleware],
-                list[MagicFilter],
-                list[BaseFilter],
-            ]
-        ]
-        if self._ready:
-            if self._cached_router_entries is None:
-                self._cached_router_entries = self._build_dispatch_entries()
+        entries: Iterable[_DispatchEntry]
+        # Страховка: между _ensure_prepared() в handle() и этим местом
+        # есть await'ы, за которые могла случиться новая регистрация.
+        self._ensure_prepared()
+
+        if self._cached_router_entries is not None:
             entries = self._cached_router_entries
         else:
             entries = self._iter_dispatch_entries()
@@ -1211,6 +1459,7 @@ class Dispatcher(BotMixin):
             router_outer_middlewares,
             router_filters,
             router_base_filters,
+            handlers_index,
         ) in entries:
             router_id = router.router_id or id(router)
 
@@ -1227,6 +1476,7 @@ class Dispatcher(BotMixin):
             matching_handlers = self._find_matching_handlers(
                 router=router,
                 event_type=event_object.update_type,
+                handlers_index=handlers_index,
             )
             if not matching_handlers:
                 continue
@@ -1481,7 +1731,17 @@ class Dispatcher(BotMixin):
         """
         process_info = "нет данных"
 
+        # Маркер «эта задача выполняет handle() ЭТОГО диспетчера»:
+        # по нему shutdown() распознаёт реентрантный вызов
+        # (обработчик остановил диспетчер сам). Без задачи в маркере
+        # его не ставим: сравнивать было бы не с чем.
+        current_task = asyncio.current_task()
+        token = _in_handler.set(
+            (self, current_task) if current_task is not None else None
+        )
         try:
+            self._ensure_prepared()
+
             ids = event_object.get_ids()
             process_info = (
                 f"{event_object.update_type} | "
@@ -1499,6 +1759,8 @@ class Dispatcher(BotMixin):
                 process_info,
                 e,
             )
+        finally:
+            _in_handler.reset(token)
 
     async def _handle_locked(
         self,
@@ -1594,18 +1856,82 @@ class Dispatcher(BotMixin):
                 e,
             )
 
+    async def _sleep_unless_stopped(self, delay: float) -> None:
+        """
+        Пауза, которую прерывает остановка polling.
+
+        Вне polling (событие остановки не создано) ведёт себя как
+        обычный ``asyncio.sleep``.
+
+        Args:
+            delay: Длительность паузы в секундах.
+        """
+        stop_event = self._stop_event
+
+        if stop_event is None:
+            await asyncio.sleep(delay)
+            return
+
+        with suppress(AsyncioTimeoutError):
+            await asyncio.wait_for(stop_event.wait(), delay)
+
+    async def _get_updates_or_stop(self, bot: Bot) -> dict | None:
+        """
+        Запрашивает обновления, прерываясь на остановке polling.
+
+        Висящий long polling запрос отменяется сразу после
+        :meth:`stop_polling`, иначе остановка ждала бы таймаута
+        запроса. Вне polling запрос выполняется как обычно.
+
+        Args:
+            bot: Экземпляр бота.
+
+        Returns:
+            dict | None: ответ API или None, если polling остановлен.
+        """
+        stop_event = self._stop_event
+
+        if stop_event is None:
+            return await bot.get_updates(marker=bot.marker_updates)
+
+        if stop_event.is_set():
+            # Остановка уже запрошена — не начинаем новый запрос.
+            return None
+
+        fetch = asyncio.ensure_future(
+            bot.get_updates(marker=bot.marker_updates)
+        )
+        waiter = asyncio.ensure_future(stop_event.wait())
+        tasks: set[asyncio.Task[Any]] = {fetch, waiter}
+
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            # Вспомогательные задачи не должны пережить выход из метода,
+            # в том числе при внешней отмене самой задачи polling.
+            waiter.cancel()
+            if not fetch.done():
+                fetch.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        if fetch.cancelled():
+            return None
+
+        return fetch.result()
+
     async def _fetch_updates_once(self, bot: Bot) -> dict | None:
         """
         Делает один запрос get_updates.
 
         Returns:
-            dict | None: словарь событий или None при recoverable-ошибке.
+            dict | None: словарь событий, или None при
+            recoverable-ошибке либо остановке polling.
 
         Raises:
             InvalidToken: при неверном токене бота.
         """
         try:
-            return await bot.get_updates(marker=bot.marker_updates)
+            return await self._get_updates_or_stop(bot)
         except AsyncioTimeoutError:
             return None
         except (MaxConnection, ClientConnectorError) as e:
@@ -1615,7 +1941,7 @@ class Dispatcher(BotMixin):
                 e,
                 CONNECTION_RETRY_DELAY,
             )
-            await asyncio.sleep(CONNECTION_RETRY_DELAY)
+            await self._sleep_unless_stopped(CONNECTION_RETRY_DELAY)
             return None
         except InvalidToken:
             logger_dp.error("Неверный токен! Останавливаю polling")
@@ -1627,14 +1953,14 @@ class Dispatcher(BotMixin):
                 e,
                 GET_UPDATES_RETRY_DELAY,
             )
-            await asyncio.sleep(GET_UPDATES_RETRY_DELAY)
+            await self._sleep_unless_stopped(GET_UPDATES_RETRY_DELAY)
             return None
         except Exception as e:
             logger_dp.error(
                 "Неожиданная ошибка при получении обновлений: %r",
                 e,
             )
-            await asyncio.sleep(GET_UPDATES_RETRY_DELAY)
+            await self._sleep_unless_stopped(GET_UPDATES_RETRY_DELAY)
             return None
 
     async def _dispatch_fetched_events(
@@ -1677,7 +2003,7 @@ class Dispatcher(BotMixin):
             logger_dp.error(
                 "Ошибка подключения, жду %s секунд", CONNECTION_RETRY_DELAY
             )
-            await asyncio.sleep(CONNECTION_RETRY_DELAY)
+            await self._sleep_unless_stopped(CONNECTION_RETRY_DELAY)
         except Exception as e:
             # Маркер не сдвинут, поэтому та же пачка придёт снова.
             # Пауза нужна, чтобы не крутить цикл вхолостую.
@@ -1686,7 +2012,7 @@ class Dispatcher(BotMixin):
                 e,
                 GET_UPDATES_RETRY_DELAY,
             )
-            await asyncio.sleep(GET_UPDATES_RETRY_DELAY)
+            await self._sleep_unless_stopped(GET_UPDATES_RETRY_DELAY)
 
     async def start_polling(
         self, bot: Bot, *, skip_updates: bool = False
@@ -1694,37 +2020,257 @@ class Dispatcher(BotMixin):
         """
         Запускает цикл получения обновлений (long polling).
 
+        Остановить цикл можно методом :meth:`stop_polling`, который
+        дожидается выхода из самого цикла (а не задачи, вызвавшей этот
+        метод: та может продолжать работу и после возврата отсюда).
+
+        Отмена задачи снаружи (``task.cancel()``) корректной остановкой
+        не является: цикл прервётся, но фоновые задачи обработчиков
+        (``use_create_task=True``) не будут дожданы, а изоляция событий
+        не будет закрыта. Останавливайте через :meth:`stop_polling`
+        либо вызовите :meth:`shutdown` после отмены. Перед новым
+        запуском дождитесь отменённой задачи (``await task`` с
+        подавлением ``CancelledError``): пока она не завершилась,
+        повторный вызов будет отклонён или задержан (см. ниже).
+
+        Повторный вызов на ЖИВОМ цикле — ``RuntimeError``. Если же цикл
+        уже вышел, но уборка за прошлым запуском ещё идёт — отложенный
+        дренаж фоновых задач от инлайн-обработчика (см.
+        :meth:`shutdown`) или ``shutdown()`` внешнего
+        :meth:`stop_polling`, — вызов не отклоняется, а ждёт её
+        окончания и только затем стартует. Иначе уборка прошлого
+        запуска закрыла бы изоляцию уже нового цикла. Благодаря этому
+        идиома ``while True: await dp.start_polling(bot)`` переживает
+        остановку снаружи. Перезапускать цикл нужно именно снаружи
+        обработчиков: ожидание уборки из задачи, которую эта же уборка
+        дренирует, замкнуло бы кольцо.
+
+        Ручная остановка через ``dp.polling = False`` (старый идиом)
+        оставляет висеть текущий запрос ``get_updates`` до его
+        таймаута. Если флаг сброшен снаружи между пачками (после
+        получения ответа, но до начала его диспетчеризации), пачка
+        целиком пропускается — маркер не сдвинут, и эти события
+        придут снова при следующем запуске. А вот сброс флага
+        инлайн-обработчиком посреди диспетчеризации самой пачки
+        (``use_create_task=False``) на неё уже не влияет: цикл по
+        событиям пачки не проверяет ``self.polling`` на каждой
+        итерации, поэтому остаток пачки дорабатывается как обычно и
+        маркер сдвигается.
+
         Args:
             bot: Экземпляр бота.
             skip_updates: Флаг, отвечающий за обработку старых событий.
+
+        Raises:
+            RuntimeError: Если цикл polling на этом диспетчере ещё жив.
         """
+        while True:
+            if self._polling_active:
+                msg = (
+                    "Polling уже запущен на этом диспетчере. "
+                    "Остановите его через stop_polling() перед новым "
+                    "запуском либо используйте отдельный Dispatcher."
+                )
+                raise RuntimeError(msg)
+
+            cleanup_done = self._cleanup_done
+            if cleanup_done is None or self._lifecycle_holders == 0:
+                break
+
+            # Цикл вышел, но за прошлым запуском ещё убирают: ждём,
+            # иначе та уборка закрыла бы изоляцию уже нашего цикла.
+            # После пробуждения проверяем всё заново: пока мы ждали,
+            # старт мог перехватить кто-то другой.
+            logger_dp.debug("Жду окончания уборки за прошлым запуском")
+            await cleanup_done.wait()
+
+        self._polling_active = True
+        self._lifecycle_holders += 1
+        self._cleanup_done = asyncio.Event()
         self.polling = True
+        self._polling_task = asyncio.current_task()
+        self._stop_event = asyncio.Event()
+        self._polling_error = None
+        # Ожидающие остановки ждут именно это событие, а не задачу
+        # вызывающего: она может продолжаться и после выхода из цикла.
+        loop_done = self._loop_done = asyncio.Event()
 
-        await self.__ready(bot)
+        try:
+            try:
+                await self.__ready(bot)
 
-        current_timestamp = to_ms(datetime.now())
+                current_timestamp = to_ms(datetime.now())
 
-        while self.polling:
-            events = await self._fetch_updates_once(bot)
-            if events is None:
-                continue
-            await self._dispatch_fetched_events(
-                events, current_timestamp, skip_updates=skip_updates
-            )
+                while self.polling:
+                    events = await self._fetch_updates_once(bot)
+                    if events is None:
+                        # Recoverable-ошибка или остановка: пробуем
+                        # снова (или выходим по условию цикла).
+                        continue
+                    if not self.polling:
+                        # Пачку, полученную уже после остановки, не
+                        # обрабатываем: маркер не сдвинут, и эти события
+                        # придут снова при следующем запуске.
+                        continue
+                    await self._dispatch_fetched_events(
+                        events, current_timestamp, skip_updates=skip_updates
+                    )
+            except BaseException as e:
+                # Ошибку запоминаем для stop_polling: он больше не
+                # дожидается задачи и не может прочитать её exception().
+                # Отмена ошибкой цикла не считается — о ней знает тот,
+                # кто отменял.
+                if not isinstance(e, asyncio.CancelledError):
+                    self._polling_error = e
+                raise
+            finally:
+                self.polling = False
+                self._polling_task = None
+                self._stop_event = None
+                # Остановка могла прийтись на подготовку (__ready): та
+                # дописывает _ready=True уже после сброса в
+                # stop_polling, поэтому сбрасываем здесь — иначе
+                # следующий start_polling молча пропустил бы check_me
+                # и on_started.
+                self._ready = False
+                # Цикл больше не жив: с этого момента повторный
+                # start_polling не отклоняется, а ждёт уборки.
+                self._polling_active = False
+                # Будим ожидающих сразу после выхода из цикла: ждать
+                # отложенного дренажа им нельзя — среди дренируемых
+                # задач может быть та самая, что вызвала stop_polling.
+                loop_done.set()
+        finally:
+            try:
+                if self._deferred_shutdown:
+                    # Инлайн-обработчик остановил диспетчер сам: дренаж
+                    # был отложен, теперь мы вне handle() и можем
+                    # дождаться фоновых задач и закрыть изоляцию. При
+                    # внешней отмене задачи (task.cancel()) флаг обычно
+                    # не выставлен, и лишнего await здесь нет. Но если
+                    # инлайн-обработчик успел взвести флаг, а затем
+                    # задачу всё же отменили, отложенный shutdown всё
+                    # равно выполнится — этот finally отрабатывает и в
+                    # процессе отмены.
+                    self._deferred_shutdown = False
+                    await self.shutdown()
+            finally:
+                # Держателя уборки отпускаем последним: до этого
+                # момента повторный start_polling ждёт, иначе уборка
+                # отсюда задела бы уже новый цикл. Отпускаем и при
+                # внешней отмене — этот finally отрабатывает и в
+                # процессе отмены, счётчик не залипает.
+                self._loop_done = None
+                self._release_lifecycle()
 
     async def stop_polling(self) -> None:
         """
         Останавливает цикл получения обновлений (long polling).
 
-        Дожидается завершения всех фоновых задач (use_create_task=True),
-        запущенных до момента остановки.
+        Прерывает висящий запрос ``get_updates`` и паузы между
+        попытками, после чего дожидается выхода из цикла
+        :meth:`start_polling` и всех фоновых задач
+        (``use_create_task=True``), запущенных до момента остановки.
+        После возврата из метода никакой активности диспетчера не
+        остаётся.
+
+        Ожидается именно цикл, а не задача, вызвавшая
+        :meth:`start_polling`: при ``await dp.start_polling(bot)``
+        внутри более крупной корутины та задача продолжает работу и
+        после остановки — ждать её означало бы дедлок, если её
+        продолжение ждёт останавливающий обработчик.
+
+        Сетевые вызовы этапа старта (``check_me``, проверка подписок) и
+        колбэк ``on_started`` не прерываются: остановка дождётся их
+        завершения и только потом вернёт управление.
+
+        Если метод вызван из обработчика, выполняющегося прямо в
+        задаче polling (``use_create_task=False``), дожидаться цикла
+        нельзя — задача не может дождаться саму себя. В этом случае
+        выставляются только флаги, а цикл завершится сразу после
+        возврата из обработчика; дренаж фоновых задач и закрытие
+        изоляции произойдут сразу после выхода из цикла
+        (см. :meth:`shutdown`).
+
+        Отложенного дренажа (инлайн-остановка) метод не ждёт: среди
+        дренируемых задач может быть та самая, из которой вызвана
+        остановка. Пока эта уборка идёт, повторный
+        :meth:`start_polling` не отклоняется, а ждёт её окончания.
+
+        Зато на время ожидания цикла и собственного ``shutdown()``
+        метод сам удерживает уборку за прошлым запуском: новый
+        :meth:`start_polling` дождётся возврата отсюда и только затем
+        стартует — иначе этот ``shutdown()`` дренировал бы фон и
+        закрывал изоляцию уже нового цикла.
+
+        Ручная остановка через ``dp.polling = False`` полноценной
+        заменой не является: висящий запрос ``get_updates`` не
+        прерывается, уже полученная пачка не диспетчеризуется (придёт
+        снова при следующем запуске), а фоновые задачи и изоляция
+        остаются на совести вызывающего.
+
+        Вызов до фактического старта цикла (``create_task`` на
+        :meth:`start_polling` без единого await между ними) — no-op:
+        задачи ещё нет, флаг ``polling`` не выставлен, и цикл потом
+        запустится как обычно. Дайте задаче стартовать (например,
+        ``await asyncio.sleep(0)``) перед остановкой.
         """
         if self.polling:
             self.polling = False
             self._ready = False
-            logger_dp.info("Polling остановлен")
+            if self._stop_event is not None:
+                self._stop_event.set()
+            logger_dp.info("Останавливаю polling")
 
-        await self.shutdown()
+        loop_done = self._loop_done
+        if self._polling_task is asyncio.current_task():
+            # Инлайн-стоп: дождаться цикла из него самого нельзя.
+            loop_done = None
+
+        if loop_done is not None:
+            # Держим уборку за прошлым запуском, пока ждём цикл и
+            # дренируем фон. Инлайн-стоп и стоп без запущенного цикла
+            # счётчик не трогают: первый убирает не здесь, а в finally
+            # цикла, второму убирать не за кем.
+            self._lifecycle_holders += 1
+
+        try:
+            if loop_done is not None:
+                await loop_done.wait()
+
+                logger_dp.info("Polling остановлен")
+
+                error = self._polling_error
+                if error is not None:
+                    # Забираем ошибку, чтобы конкурентные остановки и
+                    # следующие вызовы не повторяли одно сообщение.
+                    self._polling_error = None
+                    logger_dp.error(
+                        "Цикл polling завершился с ошибкой: %r",
+                        error,
+                    )
+
+            await self.shutdown()
+        finally:
+            if loop_done is not None:
+                self._release_lifecycle()
+
+    def _release_lifecycle(self) -> None:
+        """
+        Отпускает держателя уборки за запуском polling.
+
+        Держателей двое: сам :meth:`start_polling` (до конца своего
+        ``finally``, включая отложенный дренаж) и внешний
+        :meth:`stop_polling` (пока ждёт цикл и дренирует фон). Когда
+        последний отпустил, будим :meth:`start_polling`, ожидающий
+        окончания уборки: с этого момента новый цикл может стартовать,
+        не рискуя, что чужой ``shutdown()`` закроет его изоляцию.
+        """
+        self._lifecycle_holders -= 1
+        if self._lifecycle_holders <= 0:
+            self._lifecycle_holders = 0
+            if self._cleanup_done is not None:
+                self._cleanup_done.set()
 
     async def shutdown(self) -> None:
         """
@@ -1741,15 +2287,83 @@ class Dispatcher(BotMixin):
         webhook-интеграции вызывают shutdown после остановки приёма
         запросов).
 
+        Реентрантный вызов (из обработчика — обычно через
+        :meth:`stop_polling`) только выставляет признак завершения:
+        дренировать фоновые задачи и закрывать изоляцию нельзя. Другие
+        обработчики того же пользователя ждут блокировку
+        ``event_isolation``, которую удерживает вызывающий, — ожидание
+        их завершения замкнуло бы кольцо. Оставшиеся задачи доработают
+        сами; чтобы дождаться их, вызовите ``shutdown()`` снаружи
+        обработчика. Исключение — инлайн-обработчик в задаче polling:
+        для него дренаж откладывается до выхода из цикла и выполняется
+        автоматически (см. :meth:`start_polling`).
+
+        Реентрантным считается вызов из ТОЙ ЖЕ задачи, которая прямо
+        сейчас выполняет :meth:`handle` ЭТОГО диспетчера (маркер
+        ``_in_handler``). Способ запуска обработчика роли не играет:
+        так опознаются и инлайн-обработчик в задаче polling, и задача
+        из :meth:`spawn_handle_task`, и вебхук с
+        ``use_create_task=False``, где ``handle()`` вызывается прямо в
+        задаче HTTP-запроса. Кольцо всё же возможно, если обработчик
+        сам дожидается порождённой им задачи, которая вызывает
+        ``shutdown()``: у дочерней задачи ``current_task()`` другой,
+        и её вызов реентрантным не считается.
+
+        Отложенный дренаж (см. выше про инлайн-обработчик) выполняется
+        только при выходе из цикла polling. Поэтому ``shutdown()`` из
+        инлайн-обработчика без последующей остановки polling ничего не
+        завершает: флаг ``_deferred_shutdown`` остаётся взведённым до
+        конца цикла, а ``_closing=True`` тем временем даёт warning
+        в :meth:`spawn_handle_task` при постановке новых задач.
+
+        Готовность (``_ready``) метод не сбрасывает: повторный
+        :meth:`startup` подготовку не повторяет (не будет ни
+        ``check_me``, ни ``on_started``). Для полного перезапуска
+        используйте :meth:`stop_polling`.
+
         Вызывается автоматически из :meth:`stop_polling` и из
         shutdown-хуков webhook-интеграций
         (:class:`~maxapi.webhook.base.BaseMaxWebhook`). Идемпотентен.
         """
         self._closing = True
 
+        # Одного признака «мы внутри handle()» мало: ContextVar
+        # наследуется в create_task и общий для всех диспетчеров
+        # процесса. Поэтому в маркере лежит пара (диспетчер, задача):
+        # реентрантен вызов только из той же задачи и для того же
+        # диспетчера.
+        current = asyncio.current_task()
+        marker = _in_handler.get()
+        reentrant = (
+            marker is not None and marker[0] is self and marker[1] is current
+        )
+
+        if reentrant:
+            if current is self._polling_task:
+                # Инлайн-обработчик (use_create_task=False) выполняется
+                # в самой задаче polling: дренаж и закрытие изоляции
+                # откладываем до выхода из цикла, там мы уже вне
+                # handle() (см. finally в start_polling).
+                self._deferred_shutdown = True
+                logger_dp.debug(
+                    "shutdown вызван из инлайн-обработчика: дренаж "
+                    "отложен до завершения цикла polling",
+                )
+            elif others := self._background_tasks - {current}:
+                logger_dp.warning(
+                    "shutdown вызван из обработчика: дренаж фоновых "
+                    "задач (%d) и закрытие изоляции пропущены",
+                    len(others),
+                )
+            else:
+                logger_dp.debug(
+                    "shutdown вызван из обработчика: дренировать "
+                    "нечего, изоляция не закрыта",
+                )
+            return
+
         drained = False
-        while self._background_tasks:
-            pending = tuple(self._background_tasks)
+        while pending := tuple(self._background_tasks):
             logger_dp.info(
                 "Ожидаю завершения %d фоновых задач...",
                 len(pending),
@@ -1891,6 +2505,11 @@ class ErrorEventObserver:
         self.router.error_handlers.append(
             ErrorHandler(*args, func_event=func_event)
         )
+        # Обработчики ошибок читаются напрямую из router.error_handlers,
+        # но инвалидация всё равно нужна: только перестройка заполняет
+        # error_handler.func_args (без него call_error_handler на каждой
+        # ошибке заново разбирает сигнатуру через inspect).
+        self.router._invalidate_handlers()  # noqa: SLF001
         return func_event
 
     def __call__(self, *args: Any, **kwargs: Any) -> Callable:
@@ -1956,6 +2575,26 @@ class Event:
             )
 
         if self.update_type == UpdateType.ON_STARTED:
+            # Предупреждаем только тогда, когда колбэк действительно
+            # опоздал: подготовка уже пройдена и не сброшена
+            # (``_ready``) либо колбэк регистрируют изнутри самого
+            # on_started (``_running_on_started``). Регистрация в
+            # окне подготовки ДО фазы on_started (например из-под
+            # долгого check_me) не опоздала: колбэк будет прочитан и
+            # вызван в этом же запуске. После stop_polling() бот
+            # остаётся привязан, но подготовка сброшена, и следующий
+            # start_polling колбэк вызовет — предупреждать там не о
+            # чем.
+            if (
+                self.router._ready  # noqa: SLF001
+                or self.router._running_on_started  # noqa: SLF001
+            ):
+                logger_dp.warning(
+                    "Колбэк on_started зарегистрирован слишком поздно: "
+                    "он не будет вызван, подготовка диспетчера уже "
+                    "выполнена либо колбэк регистрируется изнутри "
+                    "самого on_started.",
+                )
             self.router.on_started_func = func_event
 
         else:
@@ -1967,6 +2606,7 @@ class Event:
                     **kwargs,
                 )
             )
+            self.router._invalidate_handlers()  # noqa: SLF001
         return func_event
 
     def __call__(self, *args: Any, **kwargs: Any) -> Callable:
