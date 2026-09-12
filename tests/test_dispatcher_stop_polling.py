@@ -402,7 +402,12 @@ class TestStopPollingSafety:
         assert task.done()
         assert task in dispatcher._background_tasks
 
-        await asyncio.wait_for(dispatcher.shutdown(), STOP_TIMEOUT)
+        # Без wait_for: до Python 3.12 он оборачивал бы shutdown() в
+        # отдельную задачу, и done-callback успел бы убрать задачу из
+        # пула ещё до начала дренажа — гонка не воспроизвелась бы.
+        # От зависания тест это всё равно не защищало: busy-loop не
+        # уступает цикл событий, и таймаут не сработал бы.
+        await dispatcher.shutdown()
 
         assert dispatcher._background_tasks == set()
         logged = any(
