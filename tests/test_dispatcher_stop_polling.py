@@ -357,8 +357,41 @@ class TestStopPollingSafety:
             await asyncio.wait_for(
                 asyncio.gather(*dispatcher._background_tasks), STOP_TIMEOUT
             )
+            # Из пула задачу удаляет её done-callback — даём ему
+            # выполниться (с 3.12 gather() по завершённым задачам не
+            # уступает цикл событий).
+            await _let_tasks_run()
 
         assert handled == [fixture_message_created]
+        assert dispatcher._background_tasks == set()
+
+    async def test_shutdown_drains_finished_task_before_its_callback(
+        self,
+    ):
+        """shutdown не зацикливается на завершённой, но не убранной задаче.
+
+        Обработчик будит вызывающего событием и завершается; тот
+        вызывает ``shutdown()`` раньше, чем done-callback задачи успел
+        удалить её из пула. С Python 3.12 ``gather()`` по уже
+        завершённым задачам не уступает цикл событий — без явного
+        удаления из пула дренаж крутился бы вечно.
+        """
+        dispatcher = Dispatcher(use_create_task=True)
+        released = asyncio.Event()
+
+        async def _handler():
+            released.set()
+
+        task = asyncio.create_task(_handler())
+        dispatcher._background_tasks.add(task)
+        task.add_done_callback(dispatcher._on_background_task_done)
+
+        await released.wait()
+        assert task.done()
+        assert task in dispatcher._background_tasks
+
+        await asyncio.wait_for(dispatcher.shutdown(), STOP_TIMEOUT)
+
         assert dispatcher._background_tasks == set()
 
     async def test_stop_does_not_wait_for_caller_task(
@@ -395,6 +428,9 @@ class TestStopPollingSafety:
             new=AsyncMock(return_value=[fixture_message_created]),
         ):
             await asyncio.wait_for(_main(), STOP_TIMEOUT)
+            # Обработчик будит ``_main`` раньше, чем завершается сам:
+            # даём его done-callback убрать задачу из пула.
+            await _let_tasks_run()
 
         assert order == ["цикл завершён", "остановлен", "продолжение"]
         assert dispatcher._background_tasks == set()
@@ -617,6 +653,7 @@ class TestStopPollingSafety:
         entered = asyncio.Event()
         release = asyncio.Event()
         restarted = asyncio.Event()
+        first_done = asyncio.Event()
         order: list[str] = []
 
         @dispatcher.message_created()
@@ -627,6 +664,7 @@ class TestStopPollingSafety:
         async def _restarter():
             await dispatcher.start_polling(polling_bot)
             order.append("первый цикл завершён")
+            first_done.set()
             polling_bot.get_updates = _hanging_updates(restarted, [])
             await dispatcher.start_polling(polling_bot)
 
@@ -645,6 +683,10 @@ class TestStopPollingSafety:
             stopper = asyncio.create_task(_stopper())
 
             await asyncio.wait_for(entered.wait(), STOP_TIMEOUT)
+            # Число оборотов цикла до выхода A из start_polling зависит
+            # от версии asyncio — ждём сам факт, а не фиксированное
+            # число итераций.
+            await asyncio.wait_for(first_done.wait(), STOP_TIMEOUT)
             await _let_tasks_run()
 
             # Цикл вышел, A уже вернулась из первого start_polling, но
