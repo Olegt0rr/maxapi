@@ -47,6 +47,16 @@ async def _let_tasks_run(iterations: int = 5) -> None:
         await asyncio.sleep(0)
 
 
+async def _await_background(dispatcher: Dispatcher) -> None:
+    """Дожидается фоновых задач вместе с их done-callback'ами.
+
+    ``asyncio.wait`` всегда уступает цикл событий, поэтому к возврату
+    задачи уже убраны из пула (см. дренаж в ``Dispatcher.shutdown``).
+    """
+    if pending := tuple(dispatcher._background_tasks):
+        await asyncio.wait_for(asyncio.wait(pending), STOP_TIMEOUT)
+
+
 def _reentrancy_warnings(caplog) -> list[str]:
     """Предупреждения shutdown о вызове из обработчика."""
     return [
@@ -354,35 +364,35 @@ class TestStopPollingSafety:
 
             # Сам обработчик доживает в фоне: он дожидался цикла polling,
             # а не наоборот (иначе задача ждала бы саму себя).
-            await asyncio.wait_for(
-                asyncio.gather(*dispatcher._background_tasks), STOP_TIMEOUT
-            )
-            # Из пула задачу удаляет её done-callback — даём ему
-            # выполниться (с 3.12 gather() по завершённым задачам не
-            # уступает цикл событий).
-            await _let_tasks_run()
+            await _await_background(dispatcher)
 
         assert handled == [fixture_message_created]
         assert dispatcher._background_tasks == set()
 
+    @pytest.mark.parametrize("failing", [False, True], ids=["ok", "error"])
     async def test_shutdown_drains_finished_task_before_its_callback(
-        self,
+        self, caplog, failing
     ):
         """shutdown не зацикливается на завершённой, но не убранной задаче.
 
-        Обработчик будит вызывающего событием и завершается; тот
-        вызывает ``shutdown()`` раньше, чем done-callback задачи успел
-        удалить её из пула. С Python 3.12 ``gather()`` по уже
-        завершённым задачам не уступает цикл событий — без явного
-        удаления из пула дренаж крутился бы вечно.
+        Задача будит вызывающего событием и завершается; тот вызывает
+        ``shutdown()`` раньше, чем done-callback задачи успел удалить её
+        из пула (см. дренаж в ``Dispatcher.shutdown``). К возврату из
+        ``shutdown()`` callback уже отработал: задача убрана из пула, а
+        её ошибка залогирована. Задача регистрируется в пуле напрямую:
+        ``spawn_handle_task`` без запущенного диспетчера обработчик не
+        найдёт, а ``handle()`` сам перехватывает исключения.
         """
         dispatcher = Dispatcher(use_create_task=True)
         released = asyncio.Event()
 
-        async def _handler():
+        async def _task():
             released.set()
+            if failing:
+                msg = "упал"
+                raise RuntimeError(msg)
 
-        task = asyncio.create_task(_handler())
+        task = asyncio.create_task(_task())
         dispatcher._background_tasks.add(task)
         task.add_done_callback(dispatcher._on_background_task_done)
 
@@ -393,6 +403,11 @@ class TestStopPollingSafety:
         await asyncio.wait_for(dispatcher.shutdown(), STOP_TIMEOUT)
 
         assert dispatcher._background_tasks == set()
+        logged = any(
+            "Необработанное исключение в фоновой задаче" in r.getMessage()
+            for r in caplog.records
+        )
+        assert logged is failing
 
     async def test_stop_does_not_wait_for_caller_task(
         self, polling_bot, fixture_message_created
@@ -471,9 +486,7 @@ class TestStopPollingSafety:
             task = asyncio.create_task(dispatcher.start_polling(polling_bot))
             await asyncio.wait_for(task, STOP_TIMEOUT)
 
-            await asyncio.wait_for(
-                asyncio.gather(*dispatcher._background_tasks), STOP_TIMEOUT
-            )
+            await _await_background(dispatcher)
 
         # Изоляция не сломана: второй обработчик дождался первого.
         assert handled == ["первый", "второй"]
@@ -1096,9 +1109,7 @@ class TestReentrantShutdown:
             await asyncio.wait_for(task, STOP_TIMEOUT)
 
             release.set()
-            await asyncio.wait_for(
-                asyncio.gather(*dispatcher._background_tasks), STOP_TIMEOUT
-            )
+            await _await_background(dispatcher)
 
         assert handled == ["первый", "второй-остановил", "первый-продолжил"]
 
@@ -1134,9 +1145,7 @@ class TestReentrantShutdown:
         ):
             task = asyncio.create_task(dispatcher.start_polling(polling_bot))
             await asyncio.wait_for(task, STOP_TIMEOUT)
-            await asyncio.wait_for(
-                asyncio.gather(*dispatcher._background_tasks), STOP_TIMEOUT
-            )
+            await _await_background(dispatcher)
 
         assert handled == ["обработан"]
         assert _reentrancy_warnings(caplog) == []

@@ -2368,13 +2368,15 @@ class Dispatcher(BotMixin):
                 "Ожидаю завершения %d фоновых задач...",
                 len(pending),
             )
-            await asyncio.gather(*pending, return_exceptions=True)
-            # Задачу из пула удаляет её done-callback, но он мог ещё не
-            # выполниться: задача завершилась, а нас разбудили раньше.
-            # С Python 3.12 gather() по уже завершённым задачам
-            # отрабатывает синхронно и не уступает цикл событий — без
-            # явного удаления цикл while крутился бы вечно.
-            self._background_tasks.difference_update(pending)
+            # Именно wait(), а не gather(): задачу из пула удаляет её
+            # done-callback, который мог ещё не выполниться (задача
+            # завершилась, а нас разбудили раньше). С Python 3.12
+            # gather() по уже завершённым задачам не уступает цикл
+            # событий, и while крутился бы вечно. wait() всегда
+            # уступает, а call_soon выполняет callback'и по порядку —
+            # к пробуждению задачи убраны из пула, их ошибки
+            # залогированы.
+            await asyncio.wait(pending)
             drained = True
         if drained:
             logger_dp.info("Все фоновые задачи завершены")
