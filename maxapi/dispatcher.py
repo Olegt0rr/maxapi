@@ -2385,6 +2385,10 @@ class Dispatcher(BotMixin):
                 # и недождавшиеся фоновые задачи.
                 for task in pending:
                     task.cancel()
+                # cancel() лишь запрашивает отмену: как и gather(),
+                # дожидаемся, пока задачи доработают cleanup и уйдут
+                # из пула, и только потом пробрасываем отмену.
+                await asyncio.wait(pending)
                 raise
             drained = True
         if drained:

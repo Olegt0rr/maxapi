@@ -447,8 +447,9 @@ class TestStopPollingSafety:
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(shutdown, STOP_TIMEOUT)
 
-        await asyncio.wait_for(cancelled.wait(), STOP_TIMEOUT)
-        await _await_background(dispatcher)
+        # Как и с gather(): к моменту отмены shutdown() обработчик уже
+        # доработал cleanup и убран из пула.
+        assert cancelled.is_set()
         assert dispatcher._background_tasks == set()
 
     async def test_stop_does_not_wait_for_caller_task(
