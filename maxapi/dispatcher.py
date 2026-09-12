@@ -2376,7 +2376,16 @@ class Dispatcher(BotMixin):
             # уступает, а call_soon выполняет callback'и по порядку —
             # к пробуждению задачи убраны из пула, их ошибки
             # залогированы.
-            await asyncio.wait(pending)
+            try:
+                await asyncio.wait(pending)
+            except asyncio.CancelledError:
+                # gather() отменял бы дочерние задачи вместе с собой;
+                # wait() этого не делает — сохраняем поведение: отмена
+                # shutdown() (например, по таймауту lifespan) отменяет
+                # и недождавшиеся фоновые задачи.
+                for task in pending:
+                    task.cancel()
+                raise
             drained = True
         if drained:
             logger_dp.info("Все фоновые задачи завершены")

@@ -54,7 +54,10 @@ async def _await_background(dispatcher: Dispatcher) -> None:
     задачи уже убраны из пула (см. дренаж в ``Dispatcher.shutdown``).
     """
     if pending := tuple(dispatcher._background_tasks):
-        await asyncio.wait_for(asyncio.wait(pending), STOP_TIMEOUT)
+        done, _ = await asyncio.wait_for(asyncio.wait(pending), STOP_TIMEOUT)
+        for task in done:
+            if not task.cancelled() and (exc := task.exception()) is not None:
+                raise exc
 
 
 def _reentrancy_warnings(caplog) -> list[str]:
@@ -371,7 +374,7 @@ class TestStopPollingSafety:
 
     @pytest.mark.parametrize("failing", [False, True], ids=["ok", "error"])
     async def test_shutdown_drains_finished_task_before_its_callback(
-        self, caplog, failing
+        self, dispatcher, caplog, failing
     ):
         """shutdown не зацикливается на завершённой, но не убранной задаче.
 
@@ -383,7 +386,6 @@ class TestStopPollingSafety:
         ``spawn_handle_task`` без запущенного диспетчера обработчик не
         найдёт, а ``handle()`` сам перехватывает исключения.
         """
-        dispatcher = Dispatcher(use_create_task=True)
         released = asyncio.Event()
 
         async def _task():
@@ -408,6 +410,41 @@ class TestStopPollingSafety:
             for r in caplog.records
         )
         assert logged is failing
+
+    async def test_cancelled_shutdown_cancels_pending_tasks(self, dispatcher):
+        """Отмена shutdown() посреди дренажа отменяет и фоновые задачи.
+
+        Так вёл себя gather(); с переходом на wait() поведение
+        сохранено явно: обработчик не должен пережить отменённую
+        (например, по таймауту lifespan) остановку.
+        """
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def _hanging():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        task = asyncio.create_task(_hanging())
+        dispatcher._background_tasks.add(task)
+        task.add_done_callback(dispatcher._on_background_task_done)
+        await started.wait()
+
+        shutdown = asyncio.create_task(dispatcher.shutdown())
+        await _let_tasks_run()
+        assert not shutdown.done()
+
+        shutdown.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(shutdown, STOP_TIMEOUT)
+
+        await asyncio.wait_for(cancelled.wait(), STOP_TIMEOUT)
+        await _await_background(dispatcher)
+        assert dispatcher._background_tasks == set()
 
     async def test_stop_does_not_wait_for_caller_task(
         self, polling_bot, fixture_message_created
@@ -443,9 +480,8 @@ class TestStopPollingSafety:
             new=AsyncMock(return_value=[fixture_message_created]),
         ):
             await asyncio.wait_for(_main(), STOP_TIMEOUT)
-            # Обработчик будит ``_main`` раньше, чем завершается сам:
-            # даём его done-callback убрать задачу из пула.
-            await _let_tasks_run()
+            # Обработчик будит ``_main`` раньше, чем завершается сам.
+            await _await_background(dispatcher)
 
         assert order == ["цикл завершён", "остановлен", "продолжение"]
         assert dispatcher._background_tasks == set()
@@ -1053,10 +1089,7 @@ class TestReentrantShutdown:
         assert "(1)" in warnings[0]
 
         # Пропущенная задача доработает сама.
-        await asyncio.wait_for(
-            asyncio.gather(*tuple(dispatcher._background_tasks)),
-            STOP_TIMEOUT,
-        )
+        await _await_background(dispatcher)
 
         assert handled == ["вебхук", "фоновый"]
 
