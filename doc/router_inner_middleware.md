@@ -387,8 +387,8 @@ inner к handler-level**. Все они выполняются **только е
 
 ```
 admin_router:
-  router filters: OK
   matching_handlers by update_type: [handle_broadcast]
+  router filters: OK
   _dispatch_to_router:
     admin_router.outer_mw: нет (пусто)
     _check_handler_match: IsAdmin → False → skip

@@ -164,3 +164,30 @@ async def test_router_filters_skipped_without_handlers_for_event_type(
     await _make_dp(a).handle(sample_message_created_event)
 
     assert counting.calls == 0
+
+
+async def test_handled_router_data_visible_to_global_outer_middleware(
+    sample_message_created_event,
+):
+    """Данные обработавшего роутера видны глобальной outer middleware."""
+    seen = []
+
+    class GlobalMiddleware(BaseMiddleware):
+        async def __call__(self, handler, event, data):
+            result = await handler(event, data)
+            seen.append((data.get("args"), data.get("mw")))
+            return result
+
+    a = Router("A")
+    a.filter(DataFilter("args", ["from_A"]))
+    a.register_outer_middleware(DataMiddleware("mw", "from_A_mw"))
+
+    @a.message_created()
+    async def handler_a(event):
+        pass
+
+    dp = _make_dp(a)
+    dp.register_outer_middleware(GlobalMiddleware())
+    await dp.handle(sample_message_created_event)
+
+    assert seen == [(["from_A"], "from_A_mw")]

@@ -1489,17 +1489,30 @@ class Dispatcher(BotMixin):
             # роутер событие не обработал (как kwargs в aiogram).
             router_data = {**data, **router_filter_result}
 
-            if await self._dispatch_to_router(
-                router=router,
-                event_object=event_object,
-                data=router_data,
-                matching_handlers=matching_handlers,
-                router_outer_middlewares=router_outer_middlewares,
-                memory_context=memory_context,
-                current_state=current_state,
-                router_id=router_id,
-                process_info=process_info,
-            ):
+            try:
+                is_handled = await self._dispatch_to_router(
+                    router=router,
+                    event_object=event_object,
+                    data=router_data,
+                    matching_handlers=matching_handlers,
+                    router_outer_middlewares=router_outer_middlewares,
+                    memory_context=memory_context,
+                    current_state=current_state,
+                    router_id=router_id,
+                    process_info=process_info,
+                )
+            except HandlerException:
+                # Обработчик роутера запускался: его данные, как и
+                # раньше, видны глобальным outer middleware.
+                router_data.pop("_handled", None)
+                data.update(router_data)
+                raise
+
+            if is_handled:
+                # Роутер событие обработал: следующих роутеров не будет,
+                # а глобальные outer middleware после handler() должны
+                # видеть данные, записанные на уровне роутера.
+                data.update(router_data)
                 return router_id, True
 
         return router_id, False
