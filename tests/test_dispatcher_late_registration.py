@@ -155,6 +155,16 @@ class TestLateRegistration:
         late = Router("late")
         late.filter(TraceFilter("late", order))
 
+        # Фильтры роутера проверяются, только если у него есть
+        # обработчики на тип события (issue #221).
+        @early.message_created()
+        async def _early_handler(event: MessageCreated):
+            order.append("early-handler")
+
+        @late.message_created()
+        async def _late_handler(event: MessageCreated):
+            order.append("late-handler")
+
         @dispatcher.message_created()
         async def _dp_handler(event: MessageCreated):
             order.append("dp")
